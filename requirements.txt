@@ -1,0 +1,9 @@
+apify-client
+google-api-python-client
+google-auth
+google-auth-oauthlib
+openai
+pydantic
+python-dotenv
+requests
+rich

@@ -1,0 +1,2 @@
+class ApifyService:
+    pass
