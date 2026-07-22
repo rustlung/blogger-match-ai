@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from src.models.candidate_analysis import CandidateAnalysis
 from src.models.blogger_match_result import BloggerMatchResult
+from src.models.personalized_offer import PersonalizedOffer
 from src.utils.logger import logger
 
 
@@ -149,6 +150,64 @@ class LLMService:
             raise LLMServiceError("LLM response did not contain structured match result.")
 
         logger.info("LLM match request completed. model=%s", self._model)
+        return parsed
+
+    def generate_personalized_offer(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> PersonalizedOffer:
+        self._validate(system_prompt, user_prompt)
+
+        logger.info("Starting LLM personalized offer request. model=%s", self._model)
+
+        try:
+            completion = self._client.chat.completions.parse(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                response_format=PersonalizedOffer,
+            )
+        except APITimeoutError as exc:
+            logger.warning("LLM personalized offer request failed. error_type=timeout")
+            raise LLMServiceError("LLM personalized offer request timed out.") from exc
+        except APIConnectionError as exc:
+            logger.warning("LLM personalized offer request failed. error_type=connection")
+            raise LLMServiceError("LLM personalized offer API connection failed.") from exc
+        except AuthenticationError as exc:
+            logger.warning("LLM personalized offer request failed. error_type=authentication")
+            raise LLMServiceError("LLM personalized offer authentication failed.") from exc
+        except RateLimitError as exc:
+            logger.warning("LLM personalized offer request failed. error_type=rate_limit")
+            raise LLMServiceError("LLM personalized offer rate limit exceeded.") from exc
+        except BadRequestError as exc:
+            logger.warning("LLM personalized offer request failed. error_type=bad_request")
+            raise LLMServiceError("LLM personalized offer API rejected the request.") from exc
+        except APIError as exc:
+            logger.warning("LLM personalized offer request failed. error_type=api_error")
+            raise LLMServiceError("LLM personalized offer API request failed.") from exc
+        except ValidationError as exc:
+            logger.warning("LLM personalized offer request failed. error_type=validation")
+            raise LLMServiceError("LLM personalized offer response failed validation.") from exc
+
+        message = completion.choices[0].message
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            raise LLMServiceError("LLM refused to generate the personalized offer.")
+
+        parsed = getattr(message, "parsed", None)
+        if parsed is None:
+            raise LLMServiceError("LLM response did not contain structured personalized offer.")
+
+        logger.info("LLM personalized offer request completed. model=%s", self._model)
         return parsed
 
     def _validate(self, system_prompt: str, user_prompt: str) -> None:

@@ -6,14 +6,20 @@ from src.config import settings
 from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.apify_enrichment_result import ApifyEnrichmentResult
 from src.models.batch_match_result import BatchMatchError, BatchMatchResult
+from src.models.batch_personalized_offer_result import BatchPersonalizedOfferResult
 from src.models.blogger import BloggerProfile
 from src.models.blogger_match_result import MatchDecision
 from src.models.discovery import DiscoveryResult
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
 from src.models.ideal_profile_analysis import IdealProfileAnalysis
+from src.models.personalized_offer import OfferStatus
 from src.services.apify_service import ApifyService, ApifyServiceError
 from src.services.batch_matcher_service import BatchMatcherService, BatchMatcherServiceError
+from src.services.batch_personalized_offer_service import (
+    BatchPersonalizedOfferService,
+    BatchPersonalizedOfferServiceError,
+)
 from src.services.brave_search_client import BraveSearchClient
 from src.services.discovery_query_builder import DiscoveryQueryBuilder
 from src.services.discovery_service import DiscoveryService, DiscoveryServiceError, reference_usernames_from_urls
@@ -26,6 +32,8 @@ from src.services.ideal_profile_service import IdealProfileService, IdealProfile
 from src.services.llm_service import LLMService
 from src.services.matcher_prompt_builder import MatcherPromptBuilder
 from src.services.matcher_service import MatcherService
+from src.services.personalized_offer_prompt_builder import PersonalizedOfferPromptBuilder
+from src.services.personalized_offer_service import PersonalizedOfferService
 from src.services.prompt_builder import PromptBuilder
 from src.services.sheets_service import SheetsService, SheetsServiceError
 from src.utils.json_writer import AtomicJsonWriteError, atomic_write_json
@@ -37,6 +45,7 @@ IDEAL_PROFILE_RESULTS_PATH = Path("results/ideal_blogger_profile.json")
 DISCOVERED_CANDIDATES_PATH = Path("results/discovered_candidates.json")
 DISCOVERED_PROFILES_PATH = Path("results/discovered_profiles.json")
 MATCH_RESULTS_PATH = Path("results/match_results.json")
+PERSONALIZED_OFFERS_PATH = Path("results/personalized_offers.json")
 MIN_RECOMMENDED_REFERENCE_PROFILES = 3
 
 
@@ -57,6 +66,10 @@ class DiscoveredProfilesSaveError(RuntimeError):
 
 
 class MatchResultsSaveError(RuntimeError):
+    pass
+
+
+class PersonalizedOffersSaveError(RuntimeError):
     pass
 
 
@@ -245,6 +258,30 @@ def main() -> int:
     _print_match_diagnostics(match_result)
     print("Match results saved to results/match_results.json")
 
+    offer_service = PersonalizedOfferService(
+        prompt_builder=PersonalizedOfferPromptBuilder(),
+        llm_service=llm_service,
+    )
+    batch_offer_service = BatchPersonalizedOfferService(offer_service=offer_service)
+
+    try:
+        personalized_offer_result = batch_offer_service.generate_offers(
+            ideal_profile=profile_analysis.ideal_profile,
+            candidate_profiles=discovered_profiles_result.profiles,
+            match_results=match_result.matches,
+        )
+    except BatchPersonalizedOfferServiceError as e:
+        if e.result is not None:
+            _print_personalized_offer_diagnostics(e.result)
+        print(f"Ошибка: {e}")
+        return 1
+
+    if not _save_personalized_offers_or_report_error(personalized_offer_result):
+        return 1
+
+    _print_personalized_offer_diagnostics(personalized_offer_result)
+    print("Personalized offers saved to results/personalized_offers.json")
+
     return 0
 
 
@@ -390,6 +427,16 @@ def save_match_results(
         raise MatchResultsSaveError("Не удалось сохранить результаты матчинг-анализа.") from exc
 
 
+def save_personalized_offers(
+    batch_result: BatchPersonalizedOfferResult,
+    output_path: Path = PERSONALIZED_OFFERS_PATH,
+) -> None:
+    try:
+        atomic_write_json(batch_result.model_dump(mode="json"), output_path)
+    except AtomicJsonWriteError as exc:
+        raise PersonalizedOffersSaveError("Не удалось сохранить персонализированные предложения.") from exc
+
+
 def _save_results_or_report_error(
     *,
     analyzed_candidates: list[AnalyzedCandidate],
@@ -461,6 +508,17 @@ def _save_match_results_or_report_error(batch_result: BatchMatchResult) -> bool:
         save_match_results(batch_result)
     except MatchResultsSaveError as e:
         logger.error("Match results save failed: error_type=%s", type(e.__cause__).__name__)
+        print(f"Ошибка: {e}")
+        return False
+
+    return True
+
+
+def _save_personalized_offers_or_report_error(batch_result: BatchPersonalizedOfferResult) -> bool:
+    try:
+        save_personalized_offers(batch_result)
+    except PersonalizedOffersSaveError as e:
+        logger.error("Personalized offers save failed: error_type=%s", type(e.__cause__).__name__)
         print(f"Ошибка: {e}")
         return False
 
@@ -600,6 +658,40 @@ def _match_decision_counts(batch_result: BatchMatchResult) -> dict[MatchDecision
 
 def _match_error_identifier(error: BatchMatchError) -> str:
     return error.username or error.profile_url or "-"
+
+
+def _print_personalized_offer_diagnostics(batch_result: BatchPersonalizedOfferResult) -> None:
+    statuses = _offer_status_counts(batch_result)
+
+    print()
+    print("Personalized offers summary")
+    print(f"Total matches: {batch_result.total_matches}")
+    print(f"Eligible candidates: {batch_result.eligible_candidates}")
+    print(f"Skipped rejected: {batch_result.skipped_rejected}")
+    print(f"Successful offers: {batch_result.successful_offers}")
+    print(f"Failed offers: {batch_result.failed_offers}")
+    print(f"Ready offers: {statuses[OfferStatus.READY]}")
+    print(f"Needs review offers: {statuses[OfferStatus.NEEDS_REVIEW]}")
+    print("Personalized offers path: results/personalized_offers.json")
+
+    if batch_result.total_matches > 0 and batch_result.eligible_candidates == 0:
+        print("Предложения не созданы, потому что подходящих кандидатов нет.")
+
+    if batch_result.errors:
+        print()
+        print("Personalized offer technical errors:")
+        for error in batch_result.errors:
+            print(f"- {_match_error_identifier(error)} — {error.error_type}: {error.error_message}")
+
+
+def _offer_status_counts(batch_result: BatchPersonalizedOfferResult) -> dict[OfferStatus, int]:
+    counts = {
+        OfferStatus.READY: 0,
+        OfferStatus.NEEDS_REVIEW: 0,
+    }
+    for offer in batch_result.offers:
+        counts[offer.offer_status] += 1
+    return counts
 
 
 def _display(value: object) -> object:

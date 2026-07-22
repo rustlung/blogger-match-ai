@@ -13,6 +13,7 @@ from src.models.blogger_match_result import (
     MatchDecision,
     RegionStatus,
 )
+from src.models.personalized_offer import OfferStatus, PersonalizedOffer
 from src.services import llm_service
 from src.services.llm_service import LLMService, LLMServiceError
 
@@ -178,6 +179,38 @@ def test_analyze_match_converts_validation_error_to_technical_error(
         service.analyze_match("system prompt", "user prompt")
 
 
+def test_generate_personalized_offer_returns_parsed_personalized_offer(monkeypatch: pytest.MonkeyPatch) -> None:
+    offer = _offer()
+    fake_openai = _fake_openai_factory(_completion(parsed=offer))
+    monkeypatch.setattr(llm_service, "OpenAI", fake_openai.class_)
+
+    service = LLMService(
+        api_key="test-key",
+        base_url="https://example.test/openai/v1",
+        model="test-model",
+        timeout=30,
+    )
+
+    result = service.generate_personalized_offer("system prompt", "user prompt")
+
+    assert result is offer
+    parse_calls = fake_openai.instances[0].chat.completions.parse_calls
+    assert len(parse_calls) == 1
+    assert parse_calls[0]["response_format"] is PersonalizedOffer
+
+
+def test_generate_personalized_offer_raises_error_when_structured_offer_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_openai = _fake_openai_factory(_completion(parsed=None))
+    monkeypatch.setattr(llm_service, "OpenAI", fake_openai.class_)
+
+    service = LLMService("test-key", "https://example.test", "test-model", 30)
+
+    with pytest.raises(LLMServiceError, match="structured personalized offer"):
+        service.generate_personalized_offer("system prompt", "user prompt")
+
+
 def _analysis() -> CandidateAnalysis:
     return CandidateAnalysis(
         overall_score=0.8,
@@ -188,6 +221,22 @@ def _analysis() -> CandidateAnalysis:
         recommendation="shortlist",
         explanation="Good candidate fit.",
         confidence=0.85,
+    )
+
+
+def _offer() -> PersonalizedOffer:
+    return PersonalizedOffer(
+        profile_url="https://www.instagram.com/creator/",
+        username="creator",
+        match_decision=MatchDecision.RECOMMENDED,
+        match_score=82,
+        offer_status=OfferStatus.READY,
+        personalization_points=["Семейная тематика профиля."],
+        collaboration_angle="Контент близок к задачам кампании.",
+        proposed_format="Короткий обзор или серия stories.",
+        subject="Возможное сотрудничество",
+        message="Здравствуйте! Хотели бы обсудить аккуратное сотрудничество.",
+        manual_review_notes=[],
     )
 
 
@@ -225,7 +274,7 @@ def _criterion(score: int, confidence: int) -> MatchCriterionScore:
     )
 
 
-def _completion(parsed: CandidateAnalysis | None, refusal: str | None = None) -> Any:
+def _completion(parsed: Any | None, refusal: str | None = None) -> Any:
     message = SimpleNamespace(parsed=parsed, refusal=refusal)
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 

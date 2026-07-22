@@ -10,6 +10,7 @@ from src import main as main_module
 from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.apify_enrichment_result import ApifyEnrichmentResult
 from src.models.batch_match_result import BatchMatchResult
+from src.models.batch_personalized_offer_result import BatchPersonalizedOfferResult
 from src.models.blogger import BloggerProfile
 from src.models.blogger_match_result import (
     BloggerMatchResult,
@@ -23,9 +24,11 @@ from src.models.discovery import DiscoveryCandidate, DiscoveryResult
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
 from src.models.ideal_profile_analysis import IdealProfileAnalysis
+from src.models.personalized_offer import OfferStatus, PersonalizedOffer
 from src.services.discovery_service import DiscoveryServiceError
 from src.services.ideal_profile_service import IdealProfileServiceError
 from src.services.batch_matcher_service import BatchMatcherServiceError
+from src.services.batch_personalized_offer_service import BatchPersonalizedOfferServiceError
 
 
 def test_main_builds_ideal_profile_from_reference_profiles(
@@ -316,6 +319,124 @@ def test_main_saves_match_results_after_discovered_profile_enrichment(
     assert "Match results saved to results/match_results.json" in output
 
 
+def test_main_saves_personalized_offers_after_batch_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    offers_output_path = tmp_path / "personalized_offers.json"
+    candidate_profile = _blogger("offer_creator")
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[candidate_profile]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        personalized_offers_output_path=offers_output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+    payload = json.loads(offers_output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload["offers"][0]["username"] == "offer_creator"
+    assert payload["total_matches"] == 1
+    assert payload["eligible_candidates"] == 1
+    assert payload["successful_offers"] == 1
+    assert state.batch_offer_instances[0].calls == [
+        (
+            _ideal_profile_analysis(source_profiles_count=1).ideal_profile,
+            [candidate_profile],
+            [_match_result("offer_creator")],
+        )
+    ]
+    assert "Personalized offers summary" in output
+    assert "Personalized offers saved to results/personalized_offers.json" in output
+
+
+def test_main_all_rejected_personalized_offers_is_successful_empty_runtime_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    offers_output_path = tmp_path / "personalized_offers.json"
+    rejected_match = _match_result("rejected", decision=MatchDecision.REJECTED, final_score=0)
+    _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[_blogger("rejected")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        match_result=BatchMatchResult(
+            matches=[rejected_match],
+            errors=[],
+            total_candidates=1,
+            successful_matches=1,
+            failed_matches=0,
+        ),
+        offer_result=BatchPersonalizedOfferResult(
+            offers=[],
+            errors=[],
+            total_matches=1,
+            eligible_candidates=0,
+            skipped_rejected=1,
+            successful_offers=0,
+            failed_offers=0,
+        ),
+        personalized_offers_output_path=offers_output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+    payload = json.loads(offers_output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload["offers"] == []
+    assert payload["eligible_candidates"] == 0
+    assert "подходящих кандидатов нет" in output
+
+
+def test_main_returns_error_without_saving_empty_personalized_offers_when_all_eligible_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    offers_output_path = tmp_path / "personalized_offers.json"
+    failed_result = BatchPersonalizedOfferResult(
+        offers=[],
+        errors=[
+            main_module.BatchMatchError(
+                profile_url="https://www.instagram.com/broken/",
+                username="broken",
+                error_type="LLMServiceError",
+                error_message="LLM failed.",
+            )
+        ],
+        total_matches=1,
+        eligible_candidates=1,
+        skipped_rejected=0,
+        successful_offers=0,
+        failed_offers=1,
+    )
+    _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[_blogger("broken")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        offer_error=BatchPersonalizedOfferServiceError(
+            "Не удалось создать ни одного персонализированного предложения.",
+            result=failed_result,
+        ),
+        personalized_offers_output_path=offers_output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert not offers_output_path.exists()
+    assert "Ошибка: Не удалось создать ни одного персонализированного предложения." in output
+
+
 def test_main_uses_in_memory_candidate_profiles_for_batch_matcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,6 +490,29 @@ def test_save_match_results_creates_serializable_json(tmp_path) -> None:
     )
 
     main_module.save_match_results(batch_result, output_path=output_path)
+
+    raw_text = output_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+
+    assert payload == batch_result.model_dump(mode="json")
+    assert "raw_data" not in raw_text
+    assert "prompt" not in raw_text.lower()
+    assert "api_key" not in raw_text.lower()
+
+
+def test_save_personalized_offers_creates_serializable_json(tmp_path) -> None:
+    output_path = tmp_path / "personalized_offers.json"
+    batch_result = BatchPersonalizedOfferResult(
+        offers=[_offer("creator")],
+        errors=[],
+        total_matches=1,
+        eligible_candidates=1,
+        skipped_rejected=0,
+        successful_offers=1,
+        failed_offers=0,
+    )
+
+    main_module.save_personalized_offers(batch_result, output_path=output_path)
 
     raw_text = output_path.read_text(encoding="utf-8")
     payload = json.loads(raw_text)
@@ -644,18 +788,24 @@ def _patch_pipeline(
     discovery_output_path=None,
     discovered_profiles_output_path=None,
     match_output_path=None,
+    personalized_offers_output_path=None,
     save_error: Exception | None = None,
     discovery_save_error: Exception | None = None,
     discovered_profiles_save_error: Exception | None = None,
     match_result: BatchMatchResult | None = None,
     match_error: Exception | None = None,
     match_save_error: Exception | None = None,
+    offer_result: BatchPersonalizedOfferResult | None = None,
+    offer_error: Exception | None = None,
+    offer_save_error: Exception | None = None,
 ) -> SimpleNamespace:
     state = SimpleNamespace(
         apify_load_calls=[],
         ideal_profile_instances=[],
         matcher_instances=[],
         batch_matcher_instances=[],
+        personalized_offer_instances=[],
+        batch_offer_instances=[],
         discovery_instances=[],
     )
 
@@ -715,6 +865,14 @@ def _patch_pipeline(
     class FakeMatcherPromptBuilder:
         pass
 
+    class FakePersonalizedOfferPromptBuilder:
+        pass
+
+    class FakePersonalizedOfferService:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            state.personalized_offer_instances.append(self)
+
     class FakeBatchMatcherService:
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
@@ -737,6 +895,34 @@ def _patch_pipeline(
                 total_candidates=len(candidate_profiles),
                 successful_matches=len(candidate_profiles),
                 failed_matches=0,
+            )
+
+    class FakeBatchPersonalizedOfferService:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.calls: list[tuple[IdealBloggerProfile, list[BloggerProfile], list[BloggerMatchResult]]] = []
+            state.batch_offer_instances.append(self)
+
+        def generate_offers(
+            self,
+            ideal_profile: IdealBloggerProfile,
+            candidate_profiles: list[BloggerProfile],
+            match_results: list[BloggerMatchResult],
+        ) -> BatchPersonalizedOfferResult:
+            self.calls.append((ideal_profile, candidate_profiles, match_results))
+            if offer_error is not None:
+                raise offer_error
+            if offer_result is not None:
+                return offer_result
+            eligible_matches = [match for match in match_results if match.decision != MatchDecision.REJECTED]
+            return BatchPersonalizedOfferResult(
+                offers=[_offer(match.username, match_result=match) for match in eligible_matches],
+                errors=[],
+                total_matches=len(match_results),
+                eligible_candidates=len(eligible_matches),
+                skipped_rejected=len(match_results) - len(eligible_matches),
+                successful_offers=len(eligible_matches),
+                failed_offers=0,
             )
 
     class FakeDiscoveryQueryBuilder:
@@ -772,6 +958,9 @@ def _patch_pipeline(
     monkeypatch.setattr(main_module, "MatcherPromptBuilder", FakeMatcherPromptBuilder)
     monkeypatch.setattr(main_module, "MatcherService", FakeMatcherService, raising=False)
     monkeypatch.setattr(main_module, "BatchMatcherService", FakeBatchMatcherService)
+    monkeypatch.setattr(main_module, "PersonalizedOfferPromptBuilder", FakePersonalizedOfferPromptBuilder)
+    monkeypatch.setattr(main_module, "PersonalizedOfferService", FakePersonalizedOfferService)
+    monkeypatch.setattr(main_module, "BatchPersonalizedOfferService", FakeBatchPersonalizedOfferService)
     monkeypatch.setattr(main_module, "DiscoveryQueryBuilder", FakeDiscoveryQueryBuilder)
     monkeypatch.setattr(main_module, "BraveSearchClient", FakeBraveSearchClient)
     monkeypatch.setattr(main_module, "DiscoveryService", FakeDiscoveryService)
@@ -819,6 +1008,20 @@ def _patch_pipeline(
             original_save_match_results(batch_result, output_path=output_path)
 
     monkeypatch.setattr(main_module, "save_match_results", fake_save_match_results)
+
+    original_save_personalized_offers = main_module.save_personalized_offers
+
+    def fake_save_personalized_offers(
+        batch_result: BatchPersonalizedOfferResult,
+        output_path=main_module.PERSONALIZED_OFFERS_PATH,
+    ) -> None:
+        if offer_save_error is not None:
+            raise offer_save_error
+        if personalized_offers_output_path is not None:
+            output_path = personalized_offers_output_path
+            original_save_personalized_offers(batch_result, output_path=output_path)
+
+    monkeypatch.setattr(main_module, "save_personalized_offers", fake_save_personalized_offers)
 
     if analysis_output_path is not None:
         original_save_analysis_results = main_module.save_analysis_results
@@ -894,18 +1097,34 @@ def _ideal_profile_analysis(source_profiles_count: int = 1, niche: str = "лай
     )
 
 
-def _match_result(username: str) -> BloggerMatchResult:
+def _match_result(
+    username: str,
+    *,
+    decision: MatchDecision = MatchDecision.RECOMMENDED,
+    final_score: int = 82,
+) -> BloggerMatchResult:
+    region_status = RegionStatus.TARGET
+    detected_region: str | None = "Россия"
+    rejection_reasons: list[str] = []
+    if decision == MatchDecision.REVIEW:
+        region_status = RegionStatus.UNKNOWN
+        detected_region = None
+    if decision == MatchDecision.REJECTED:
+        region_status = RegionStatus.NON_TARGET
+        detected_region = "Украина"
+        rejection_reasons = ["Не целевой регион."]
+
     return BloggerMatchResult(
         profile_url=f"https://www.instagram.com/{username}/",
         username=username,
-        final_score=82,
-        decision=MatchDecision.RECOMMENDED,
-        region_status=RegionStatus.TARGET,
+        final_score=final_score,
+        decision=decision,
+        region_status=region_status,
         region_confidence=80,
-        detected_region="Россия",
+        detected_region=detected_region,
         strengths=["Тематика совпадает."],
-        risks=[],
-        rejection_reasons=[],
+        risks=["Проверить дополнительные данные."] if decision == MatchDecision.REVIEW else [],
+        rejection_reasons=rejection_reasons,
         match_summary="Кандидат подходит.",
         criteria_scores=MatchCriteriaScores(
             thematic_fit=_criterion(),
@@ -917,6 +1136,29 @@ def _match_result(username: str) -> BloggerMatchResult:
             content_style_fit=_criterion(),
             commercial_fit=_criterion(),
         ),
+    )
+
+
+def _offer(username: str, match_result: BloggerMatchResult | None = None) -> PersonalizedOffer:
+    match = match_result or _match_result(username)
+    status = OfferStatus.READY
+    manual_review_notes: list[str] = []
+    if match.decision == MatchDecision.REVIEW:
+        status = OfferStatus.NEEDS_REVIEW
+        manual_review_notes = ["Проверить риски перед отправкой."]
+
+    return PersonalizedOffer(
+        profile_url=match.profile_url,
+        username=username,
+        match_decision=match.decision,
+        match_score=match.final_score,
+        offer_status=status,
+        personalization_points=["Тематика профиля совпадает с задачей."],
+        collaboration_angle="Контент может быть релевантен кампании.",
+        proposed_format="Короткий обзор или stories.",
+        subject="Возможное сотрудничество",
+        message="Здравствуйте! Хотели бы обсудить аккуратное сотрудничество.",
+        manual_review_notes=manual_review_notes,
     )
 
 
