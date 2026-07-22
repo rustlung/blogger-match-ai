@@ -4,6 +4,7 @@ from src.models.blogger import BloggerProfile
 from src.models.candidate_analysis import CandidateAnalysis
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
+from src.models.ideal_profile_analysis import IdealProfileAnalysis
 
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "CandidateAnalysis",
     "FailedProfile",
     "IdealBloggerProfile",
+    "IdealProfileAnalysis",
 ]

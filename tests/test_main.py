@@ -13,30 +13,48 @@ from src.models.blogger import BloggerProfile
 from src.models.candidate_analysis import CandidateAnalysis
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
-from src.services.llm_service import LLMServiceError
+from src.models.ideal_profile_analysis import IdealProfileAnalysis
+from src.services.ideal_profile_service import IdealProfileServiceError
 
 
-def test_main_runs_full_successful_pipeline(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    blogger = _blogger("creator")
-    analysis = _analysis(overall_score=82.0, recommendation="Suitable")
-    matcher_state = _patch_pipeline(
+def test_main_builds_ideal_profile_from_reference_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first_profile = _blogger("first")
+    second_profile = _blogger("second")
+    third_profile = _blogger("third")
+    output_path = tmp_path / "ideal_blogger_profile.json"
+    state = _patch_pipeline(
         monkeypatch,
-        apify_result=ApifyEnrichmentResult(profiles=[blogger]),
-        matcher_side_effects=[AnalyzedCandidate(blogger=blogger, analysis=analysis)],
+        apify_result=ApifyEnrichmentResult(profiles=[first_profile, second_profile, third_profile]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=3),
+        output_path=output_path,
     )
 
     exit_code = main_module.main()
     output = capsys.readouterr().out
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
 
     assert exit_code == 0
-    assert matcher_state.instances[0].calls[0] == (_expected_ideal_profile(), blogger)
-    assert "Overall score: 82.0" in output
-    assert "Recommendation: Suitable" in output
-    assert "Analyzed successfully: 1" in output
+    assert len(state.ideal_profile_instances) == 1
+    assert state.ideal_profile_instances[0].calls == [[first_profile, second_profile, third_profile]]
+    assert state.matcher_instances == []
+    assert payload["summary"] == {
+        "profiles_requested": 3,
+        "profiles_analyzed": 3,
+        "apify_failures": 0,
+    }
+    assert payload["profile_analysis"]["ideal_profile"]["niche"] == "лайфстайл и бьюти"
+    assert "Ideal blogger profile created." in output
+    assert "Ideal blogger profile saved to results/ideal_blogger_profile.json" in output
+    assert "Candidate:" not in output
 
 
-def test_main_sends_only_successful_apify_profiles_to_matcher(
+def test_main_builds_profile_from_partial_apify_success_and_saves_failures(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     blogger = _blogger("valid")
@@ -44,32 +62,35 @@ def test_main_sends_only_successful_apify_profiles_to_matcher(
         input_url="https://www.instagram.com/missing/",
         username="missing",
         error_code="not_found",
-        error_description="Post does not exist",
+        error_description="Profile not found",
     )
-    matcher_state = _patch_pipeline(
+    output_path = tmp_path / "ideal_blogger_profile.json"
+    state = _patch_pipeline(
         monkeypatch,
-        apify_result=ApifyEnrichmentResult(
-            profiles=[blogger],
-            failed_profiles=[failed_profile],
-        ),
-        matcher_side_effects=[AnalyzedCandidate(blogger=blogger, analysis=_analysis())],
+        apify_result=ApifyEnrichmentResult(profiles=[blogger], failed_profiles=[failed_profile]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        output_path=output_path,
     )
 
     exit_code = main_module.main()
     output = capsys.readouterr().out
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
 
     assert exit_code == 0
-    assert len(matcher_state.instances[0].calls) == 1
-    assert matcher_state.instances[0].calls[0][1] is blogger
-    assert "Apify failures: 1" in output
-    assert "Failed: 1" in output
+    assert state.ideal_profile_instances[0].calls == [[blogger]]
+    assert payload["summary"]["profiles_analyzed"] == 1
+    assert payload["summary"]["apify_failures"] == 1
+    assert payload["apify_failures"] == [failed_profile.model_dump(mode="json")]
+    assert "Warning: reference sample is small" in output
 
 
-def test_main_skips_llm_when_all_apify_profiles_failed(
+def test_main_returns_error_when_only_apify_profile_errors(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    matcher_state = _patch_pipeline(
+    output_path = tmp_path / "ideal_blogger_profile.json"
+    state = _patch_pipeline(
         monkeypatch,
         apify_result=ApifyEnrichmentResult(
             failed_profiles=[
@@ -80,115 +101,105 @@ def test_main_skips_llm_when_all_apify_profiles_failed(
                 )
             ]
         ),
-        matcher_side_effects=[],
-    )
-
-    exit_code = main_module.main()
-    output = capsys.readouterr().out
-
-    assert exit_code == 0
-    assert matcher_state.instances == []
-    assert "No successful Apify profiles available for AI analysis." in output
-    assert "Sent to LLM: 0" in output
-
-
-def test_main_continues_when_one_llm_analysis_fails(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    failed_blogger = _blogger("failed")
-    successful_blogger = _blogger("success")
-    matcher_state = _patch_pipeline(
-        monkeypatch,
-        apify_result=ApifyEnrichmentResult(profiles=[failed_blogger, successful_blogger]),
-        matcher_side_effects=[
-            LLMServiceError("LLM request timed out."),
-            AnalyzedCandidate(blogger=successful_blogger, analysis=_analysis()),
-        ],
-    )
-
-    exit_code = main_module.main()
-    output = capsys.readouterr().out
-
-    assert exit_code == 0
-    assert len(matcher_state.instances[0].calls) == 2
-    assert "Analyzed successfully: 1" in output
-    assert "LLM failures: 1" in output
-    assert "- failed — LLM request timed out." in output
-
-
-def test_main_returns_error_when_all_llm_analyses_fail(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    first_blogger = _blogger("first")
-    second_blogger = _blogger("second")
-    _patch_pipeline(
-        monkeypatch,
-        apify_result=ApifyEnrichmentResult(profiles=[first_blogger, second_blogger]),
-        matcher_side_effects=[
-            LLMServiceError("LLM request timed out."),
-            LLMServiceError("LLM rate limit exceeded."),
-        ],
-    )
-
-    exit_code = main_module.main()
-    output = capsys.readouterr().out
-
-    assert exit_code == 1
-    assert "Analyzed successfully: 0" in output
-    assert "LLM failures: 2" in output
-    assert "LLM request timed out." in output
-    assert "LLM rate limit exceeded." in output
-
-
-def test_main_returns_configuration_error_without_llm_call_when_api_key_missing(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    matcher_state = _patch_pipeline(
-        monkeypatch,
-        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
-        matcher_side_effects=[],
-        settings=_settings(openai_api_key=None),
-    )
-
-    exit_code = main_module.main()
-    output = capsys.readouterr().out
-
-    assert exit_code == 1
-    assert matcher_state.llm_instances == []
-    assert matcher_state.instances == []
-    assert "LLM configuration error: OPENAI_API_KEY is not configured." in output
-    assert "secret" not in output.lower()
-
-
-def test_main_creates_results_file_when_all_llm_analyses_fail(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    output_path = tmp_path / "analysis_results.json"
-    first_blogger = _blogger("first")
-    second_blogger = _blogger("second")
-    _patch_pipeline(
-        monkeypatch,
-        apify_result=ApifyEnrichmentResult(profiles=[first_blogger, second_blogger]),
-        matcher_side_effects=[
-            LLMServiceError("LLM request timed out."),
-            LLMServiceError("LLM rate limit exceeded."),
-        ],
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
         output_path=output_path,
     )
 
     exit_code = main_module.main()
-    capsys.readouterr()
-    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    output = capsys.readouterr().out
 
     assert exit_code == 1
-    assert payload["analyzed_candidates"] == []
-    assert [failure["username"] for failure in payload["llm_failures"]] == ["first", "second"]
-    assert payload["summary"]["llm_failures"] == 2
+    assert state.ideal_profile_instances == []
+    assert not output_path.exists()
+    assert "нет успешных эталонных профилей" in output
+
+
+def test_main_returns_error_when_ideal_profile_service_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_path = tmp_path / "ideal_blogger_profile.json"
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
+        profile_error=IdealProfileServiceError("Ideal profile LLM request timed out."),
+        output_path=output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert len(state.ideal_profile_instances) == 1
+    assert not output_path.exists()
+    assert "Ошибка: Ideal profile LLM request timed out." in output
+
+
+def test_main_returns_error_when_ideal_profile_results_cannot_be_saved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        save_error=main_module.IdealProfileResultsSaveError("Не удалось сохранить портрет идеального блогера."),
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Ошибка: Не удалось сохранить портрет идеального блогера." in output
+
+
+def test_main_one_profile_warns_but_completes_when_service_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_path = tmp_path / "ideal_blogger_profile.json"
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("single")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        output_path=output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert len(state.ideal_profile_instances[0].calls) == 1
+    assert "Warning: reference sample is small" in output
+    assert any(
+        "Выборка содержит только 1 профиль" in limitation
+        for limitation in payload["profile_analysis"]["data_limitations"]
+    )
+
+
+def test_main_does_not_create_candidate_analysis_results_for_reference_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    ideal_output_path = tmp_path / "ideal_blogger_profile.json"
+    analysis_output_path = tmp_path / "analysis_results.json"
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        output_path=ideal_output_path,
+        analysis_output_path=analysis_output_path,
+    )
+
+    exit_code = main_module.main()
+
+    assert exit_code == 0
+    assert ideal_output_path.exists()
+    assert not analysis_output_path.exists()
+    assert state.matcher_instances == []
 
 
 def test_build_ideal_blogger_profile_returns_mvp_profile_with_independent_lists() -> None:
@@ -204,23 +215,49 @@ def test_build_ideal_blogger_profile_returns_mvp_profile_with_independent_lists(
     assert first_profile.required_topics is not second_profile.required_topics
 
 
-def test_save_analysis_results_creates_valid_json_without_raw_data(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    output_path = tmp_path / "results" / "analysis_results.json"
+def test_save_analysis_results_still_excludes_raw_data(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output_path = tmp_path / "analysis_results.json"
     blogger = _blogger("creator")
-    analyzed_candidate = AnalyzedCandidate(
+    candidate = AnalyzedCandidate(
         blogger=blogger,
-        analysis=_analysis(
-            recommendation="Подходит для тестовой интеграции",
-            strengths=["Хорошее соответствие аудитории"],
-        ),
+        analysis=_candidate_analysis(recommendation="Подходит"),
     )
     monkeypatch.setattr(main_module, "_generated_at", lambda: "2026-07-22T17:00:27+04:00")
 
     main_module.save_analysis_results(
-        analyzed_candidates=[analyzed_candidate],
+        analyzed_candidates=[candidate],
         apify_failures=[],
         analysis_failures=[],
-        summary=_summary(analyzed_successfully=1),
+        summary={
+            "profiles_received_from_apify": 1,
+            "apify_failures": 0,
+            "sent_to_llm": 1,
+            "analyzed_successfully": 1,
+            "llm_failures": 0,
+        },
+        output_path=output_path,
+    )
+
+    raw_text = output_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+
+    assert payload["analyzed_candidates"][0]["analysis"]["recommendation"] == "Подходит"
+    assert "raw_data" not in payload["analyzed_candidates"][0]["blogger"]
+    assert "\\u041f" not in raw_text
+
+
+def test_save_ideal_profile_results_creates_valid_json_without_raw_data(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_path = tmp_path / "results" / "ideal_blogger_profile.json"
+    failed_profile = FailedProfile(input_url="https://www.instagram.com/missing/", error_code="not_found")
+    monkeypatch.setattr(main_module, "_generated_at", lambda: "2026-07-22T18:00:00+04:00")
+
+    main_module.save_ideal_profile_results(
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=2),
+        apify_failures=[failed_profile],
+        summary={"profiles_requested": 3, "profiles_analyzed": 2, "apify_failures": 1},
         output_path=output_path,
     )
 
@@ -228,177 +265,88 @@ def test_save_analysis_results_creates_valid_json_without_raw_data(tmp_path, mon
     payload = json.loads(raw_text)
 
     assert output_path.is_file()
-    assert payload["generated_at"] == "2026-07-22T17:00:27+04:00"
-    assert payload["summary"]["analyzed_successfully"] == 1
-    assert payload["analyzed_candidates"][0]["blogger"]["username"] == "creator"
-    assert "raw_data" not in payload["analyzed_candidates"][0]["blogger"]
-    assert "Подходит для тестовой интеграции" in raw_text
-    assert "Хорошее соответствие аудитории" in raw_text
-    assert "\\u041f" not in raw_text
-
-
-def test_save_analysis_results_contains_successes_apify_failures_and_llm_failures(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    output_path = tmp_path / "analysis_results.json"
-    blogger = _blogger("creator")
-    failed_profile = FailedProfile(
-        input_url="https://www.instagram.com/missing/",
-        username="missing",
-        error_code="not_found",
-        error_description="Post does not exist",
-    )
-    monkeypatch.setattr(main_module, "_generated_at", lambda: "2026-07-22T17:00:27+04:00")
-
-    main_module.save_analysis_results(
-        analyzed_candidates=[AnalyzedCandidate(blogger=blogger, analysis=_analysis())],
-        apify_failures=[failed_profile],
-        analysis_failures=[(_blogger("llm_failed"), "LLM request timed out.")],
-        summary=_summary(analyzed_successfully=1, apify_failures=1, llm_failures=1),
-        output_path=output_path,
-    )
-
-    payload = json.loads(output_path.read_text(encoding="utf-8"))
-
-    assert len(payload["analyzed_candidates"]) == 1
+    assert payload["generated_at"] == "2026-07-22T18:00:00+04:00"
+    assert payload["summary"]["profiles_analyzed"] == 2
+    assert payload["profile_analysis"]["ideal_profile"]["niche"] == "лайфстайл и бьюти"
     assert payload["apify_failures"] == [failed_profile.model_dump(mode="json")]
-    assert payload["llm_failures"] == [
-        {
-            "username": "llm_failed",
-            "profile_url": "https://www.instagram.com/llm_failed/",
-            "error": "LLM request timed out.",
-        }
-    ]
-    assert payload["summary"]["apify_failures"] == 1
-    assert payload["summary"]["llm_failures"] == 1
+    assert "raw_data" not in raw_text
+    assert "prompt" not in raw_text.lower()
+    assert "api_key" not in raw_text.lower()
+    assert "\\u043b" not in raw_text
 
 
-def test_save_analysis_results_handles_only_apify_failures(tmp_path) -> None:
-    output_path = tmp_path / "analysis_results.json"
-    failed_profile = FailedProfile(
-        input_url="https://www.instagram.com/missing/",
-        username="missing",
-        error_code="not_found",
-    )
+def test_save_ideal_profile_results_creates_parent_directory(tmp_path) -> None:
+    output_path = tmp_path / "nested" / "results" / "ideal_blogger_profile.json"
 
-    main_module.save_analysis_results(
-        analyzed_candidates=[],
-        apify_failures=[failed_profile],
-        analysis_failures=[],
-        summary=_summary(
-            profiles_received_from_apify=0,
-            apify_failures=1,
-            sent_to_llm=0,
-            analyzed_successfully=0,
-            llm_failures=0,
-        ),
-        output_path=output_path,
-    )
-
-    payload = json.loads(output_path.read_text(encoding="utf-8"))
-
-    assert payload["analyzed_candidates"] == []
-    assert payload["apify_failures"][0]["username"] == "missing"
-    assert payload["summary"]["profiles_received_from_apify"] == 0
-    assert payload["summary"]["apify_failures"] == 1
-
-
-def test_save_analysis_results_creates_parent_directory(tmp_path) -> None:
-    output_path = tmp_path / "nested" / "results" / "analysis_results.json"
-
-    main_module.save_analysis_results(
-        analyzed_candidates=[],
+    main_module.save_ideal_profile_results(
+        profile_analysis=_ideal_profile_analysis(),
         apify_failures=[],
-        analysis_failures=[],
-        summary=_summary(),
+        summary={"profiles_requested": 1, "profiles_analyzed": 1, "apify_failures": 0},
         output_path=output_path,
     )
 
-    assert output_path.is_file()
+    assert output_path.exists()
 
 
-def test_save_analysis_results_removes_temp_file_on_write_error(
+def test_save_ideal_profile_results_replaces_existing_file(tmp_path) -> None:
+    output_path = tmp_path / "ideal_blogger_profile.json"
+
+    main_module.save_ideal_profile_results(
+        profile_analysis=_ideal_profile_analysis(niche="old"),
+        apify_failures=[],
+        summary={"profiles_requested": 1, "profiles_analyzed": 1, "apify_failures": 0},
+        output_path=output_path,
+    )
+    main_module.save_ideal_profile_results(
+        profile_analysis=_ideal_profile_analysis(niche="new"),
+        apify_failures=[],
+        summary={"profiles_requested": 1, "profiles_analyzed": 1, "apify_failures": 0},
+        output_path=output_path,
+    )
+
+    raw_text = output_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+
+    assert payload["profile_analysis"]["ideal_profile"]["niche"] == "new"
+    assert "old" not in raw_text
+
+
+def test_save_ideal_profile_results_removes_temp_file_on_write_error(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    output_path = tmp_path / "analysis_results.json"
+    output_path = tmp_path / "ideal_blogger_profile.json"
 
-    def fail_dump(*args, **kwargs) -> None:
-        raise OSError("disk full")
+    def fail_write(*args: Any, **kwargs: Any) -> None:
+        raise main_module.AtomicJsonWriteError("disk full")
 
-    monkeypatch.setattr(main_module.json, "dump", fail_dump)
+    monkeypatch.setattr(main_module, "atomic_write_json", fail_write)
 
-    with pytest.raises(main_module.AnalysisResultsSaveError):
-        main_module.save_analysis_results(
-            analyzed_candidates=[],
+    with pytest.raises(main_module.IdealProfileResultsSaveError):
+        main_module.save_ideal_profile_results(
+            profile_analysis=_ideal_profile_analysis(),
             apify_failures=[],
-            analysis_failures=[],
-            summary=_summary(),
+            summary={"profiles_requested": 1, "profiles_analyzed": 1, "apify_failures": 0},
             output_path=output_path,
         )
 
     assert not output_path.exists()
-    assert not output_path.with_name("analysis_results.json.tmp").exists()
-
-
-def test_main_returns_error_when_analysis_results_cannot_be_saved(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    blogger = _blogger("creator")
-    _patch_pipeline(
-        monkeypatch,
-        apify_result=ApifyEnrichmentResult(profiles=[blogger]),
-        matcher_side_effects=[AnalyzedCandidate(blogger=blogger, analysis=_analysis())],
-        save_error=main_module.AnalysisResultsSaveError("Не удалось сохранить результаты анализа."),
-    )
-
-    exit_code = main_module.main()
-    output = capsys.readouterr().out
-
-    assert exit_code == 1
-    assert "Ошибка: Не удалось сохранить результаты анализа." in output
-
-
-def test_save_analysis_results_replaces_existing_file(tmp_path) -> None:
-    output_path = tmp_path / "analysis_results.json"
-    first_candidate = AnalyzedCandidate(blogger=_blogger("old"), analysis=_analysis())
-    second_candidate = AnalyzedCandidate(blogger=_blogger("new"), analysis=_analysis())
-
-    main_module.save_analysis_results(
-        analyzed_candidates=[first_candidate],
-        apify_failures=[],
-        analysis_failures=[],
-        summary=_summary(analyzed_successfully=1),
-        output_path=output_path,
-    )
-    main_module.save_analysis_results(
-        analyzed_candidates=[second_candidate],
-        apify_failures=[],
-        analysis_failures=[],
-        summary=_summary(analyzed_successfully=1),
-        output_path=output_path,
-    )
-
-    payload = json.loads(output_path.read_text(encoding="utf-8"))
-
-    assert len(payload["analyzed_candidates"]) == 1
-    assert payload["analyzed_candidates"][0]["blogger"]["username"] == "new"
-    assert "old" not in output_path.read_text(encoding="utf-8")
+    assert not output_path.with_name("ideal_blogger_profile.json.tmp").exists()
 
 
 def _patch_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     apify_result: ApifyEnrichmentResult,
-    matcher_side_effects: list[Any],
+    profile_analysis: IdealProfileAnalysis | None = None,
+    profile_error: Exception | None = None,
     settings: SimpleNamespace | None = None,
     output_path=None,
+    analysis_output_path=None,
     save_error: Exception | None = None,
 ) -> SimpleNamespace:
     state = SimpleNamespace(
-        instances=[],
-        llm_instances=[],
+        ideal_profile_instances=[],
+        matcher_instances=[],
     )
 
     class FakeSheetsService:
@@ -406,58 +354,66 @@ def _patch_pipeline(
             self.kwargs = kwargs
 
         def get_instagram_urls(self) -> list[str]:
-            return ["https://www.instagram.com/creator/"]
+            return [
+                "https://www.instagram.com/first/",
+                "https://www.instagram.com/second/",
+                "https://www.instagram.com/third/",
+            ]
 
     class FakeApifyService:
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
 
         def enrich_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
+            state.apify_profile_urls = profile_urls
             return apify_result
 
-    class FakePromptBuilder:
+    class FakeIdealProfilePromptBuilder:
         pass
 
-    class FakeLLMService:
+    class FakeIdealProfileService:
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
-            state.llm_instances.append(self)
+            self.calls: list[list[BloggerProfile]] = []
+            state.ideal_profile_instances.append(self)
+
+        def build_ideal_profile(self, profiles: list[BloggerProfile]) -> IdealProfileAnalysis:
+            self.calls.append(profiles)
+            if profile_error is not None:
+                raise profile_error
+            assert profile_analysis is not None
+            return profile_analysis
 
     class FakeMatcherService:
-        def __init__(self, prompt_builder: FakePromptBuilder, llm_service: FakeLLMService) -> None:
-            self.prompt_builder = prompt_builder
-            self.llm_service = llm_service
-            self.calls: list[tuple[IdealBloggerProfile, BloggerProfile]] = []
-            self._side_effects = list(matcher_side_effects)
-            state.instances.append(self)
-
-        def match_candidate(
-            self,
-            ideal_profile: IdealBloggerProfile,
-            blogger: BloggerProfile,
-        ) -> AnalyzedCandidate:
-            self.calls.append((ideal_profile, blogger))
-            result = self._side_effects.pop(0)
-            if isinstance(result, Exception):
-                raise result
-            return result
+        def __init__(self, **kwargs: Any) -> None:
+            state.matcher_instances.append(self)
 
     monkeypatch.setattr(main_module, "settings", settings or _settings())
     monkeypatch.setattr(main_module, "SheetsService", FakeSheetsService)
     monkeypatch.setattr(main_module, "ApifyService", FakeApifyService)
-    monkeypatch.setattr(main_module, "PromptBuilder", FakePromptBuilder)
-    monkeypatch.setattr(main_module, "LLMService", FakeLLMService)
-    monkeypatch.setattr(main_module, "MatcherService", FakeMatcherService)
-    original_save_analysis_results = main_module.save_analysis_results
+    monkeypatch.setattr(main_module, "IdealProfilePromptBuilder", FakeIdealProfilePromptBuilder)
+    monkeypatch.setattr(main_module, "IdealProfileService", FakeIdealProfileService)
+    monkeypatch.setattr(main_module, "MatcherService", FakeMatcherService, raising=False)
 
-    def fake_save_analysis_results(**kwargs: Any) -> None:
+    original_save_ideal_profile_results = main_module.save_ideal_profile_results
+
+    def fake_save_ideal_profile_results(**kwargs: Any) -> None:
         if save_error is not None:
             raise save_error
         if output_path is not None:
             kwargs["output_path"] = output_path
+            original_save_ideal_profile_results(**kwargs)
+
+    monkeypatch.setattr(main_module, "save_ideal_profile_results", fake_save_ideal_profile_results)
+
+    if analysis_output_path is not None:
+        original_save_analysis_results = main_module.save_analysis_results
+
+        def fake_save_analysis_results(**kwargs: Any) -> None:
+            kwargs["output_path"] = analysis_output_path
             original_save_analysis_results(**kwargs)
 
-    monkeypatch.setattr(main_module, "save_analysis_results", fake_save_analysis_results)
+        monkeypatch.setattr(main_module, "save_analysis_results", fake_save_analysis_results)
 
     return state
 
@@ -487,47 +443,49 @@ def _blogger(username: str) -> BloggerProfile:
         full_name=f"{username} name",
         biography="Short bio",
         followers_count=1000,
+        follows_count=100,
+        posts_count=20,
+        verified=False,
+        private=False,
+        business_account=True,
+        business_category_name="Digital creator",
+        external_url=None,
+        public_email=None,
+        public_phone_number=None,
+        profile_pic_url="https://images.example/avatar.jpg",
         raw_data={"username": username},
     )
 
 
-def _analysis(
-    overall_score: float = 82.0,
-    recommendation: str = "Suitable",
-    strengths: list[str] | None = None,
-) -> CandidateAnalysis:
+def _ideal_profile_analysis(source_profiles_count: int = 1, niche: str = "лайфстайл и бьюти") -> IdealProfileAnalysis:
+    return IdealProfileAnalysis(
+        ideal_profile=IdealBloggerProfile(
+            niche=niche,
+            min_followers=1000,
+            max_followers=10000,
+            required_topics=["лайфстайл", "бьюти"],
+            required_brand_style="безопасный и естественный стиль",
+        ),
+        source_profiles_count=source_profiles_count,
+        common_traits=["Регулярно пишут о повседневном стиле"],
+        important_selection_criteria=["Ясная ниша", "Безопасная коммуникация"],
+        observed_variations=["Размер аудитории отличается"],
+        data_limitations=[],
+        explanation="Портрет построен по доступным данным профилей.",
+        confidence=60.0,
+    )
+
+
+def _candidate_analysis(recommendation: str = "Suitable") -> CandidateAnalysis:
     return CandidateAnalysis(
-        overall_score=overall_score,
+        overall_score=82.0,
         niche_match_score=80.0,
         audience_match_score=75.0,
         content_quality_score=85.0,
         brand_safety_score=90.0,
-        strengths=strengths or ["Good audience fit"],
+        strengths=["Good audience fit"],
         weaknesses=["Limited public data"],
         recommendation=recommendation,
         explanation="Compact test explanation.",
         confidence=0.86,
-    )
-
-
-def _summary(
-    profiles_received_from_apify: int = 1,
-    apify_failures: int = 0,
-    sent_to_llm: int = 1,
-    analyzed_successfully: int = 0,
-    llm_failures: int = 0,
-) -> dict[str, int]:
-    return {
-        "profiles_received_from_apify": profiles_received_from_apify,
-        "apify_failures": apify_failures,
-        "sent_to_llm": sent_to_llm,
-        "analyzed_successfully": analyzed_successfully,
-        "llm_failures": llm_failures,
-    }
-
-
-def _expected_ideal_profile() -> IdealBloggerProfile:
-    return IdealBloggerProfile(
-        niche="general lifestyle",
-        required_brand_style="authentic, brand-safe, non-controversial content",
     )

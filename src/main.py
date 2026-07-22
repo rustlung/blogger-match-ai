@@ -1,4 +1,3 @@
-import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -8,18 +7,25 @@ from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.blogger import BloggerProfile
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
+from src.models.ideal_profile_analysis import IdealProfileAnalysis
 from src.services.apify_service import ApifyService, ApifyServiceError
-from src.services.llm_service import LLMService, LLMServiceError
-from src.services.matcher_service import MatcherService
-from src.services.prompt_builder import PromptBuilder
+from src.services.ideal_profile_prompt_builder import IdealProfilePromptBuilder
+from src.services.ideal_profile_service import IdealProfileService, IdealProfileServiceError
 from src.services.sheets_service import SheetsService, SheetsServiceError
+from src.utils.json_writer import AtomicJsonWriteError, atomic_write_json
 from src.utils.logger import logger
 
 
 ANALYSIS_RESULTS_PATH = Path("results/analysis_results.json")
+IDEAL_PROFILE_RESULTS_PATH = Path("results/ideal_blogger_profile.json")
+MIN_RECOMMENDED_REFERENCE_PROFILES = 3
 
 
 class AnalysisResultsSaveError(RuntimeError):
+    pass
+
+
+class IdealProfileResultsSaveError(RuntimeError):
     pass
 
 
@@ -46,14 +52,14 @@ def main() -> int:
         return 1
 
     print("Google Sheets read successfully.")
-    print(f"Found unique Instagram profiles: {len(urls)}")
+    print(f"Found unique reference Instagram profiles: {len(urls)}")
 
     if settings.APIFY_SOURCE_PROFILES_LIMIT <= 0:
         print("Ошибка: APIFY_SOURCE_PROFILES_LIMIT должен быть больше 0.")
         return 1
 
     limited_urls = urls[: settings.APIFY_SOURCE_PROFILES_LIMIT]
-    print(f"Sending profiles to Apify: {len(limited_urls)}")
+    print(f"Reference profiles requested: {len(limited_urls)}")
 
     apify_service = ApifyService(
         api_token=settings.APIFY_API_TOKEN,
@@ -67,9 +73,8 @@ def main() -> int:
         print(f"Ошибка: {e}")
         return 1
 
-    print(f"Total profiles: {len(enrichment_result.profiles) + len(enrichment_result.failed_profiles)}")
-    print(f"Parsed successfully: {len(enrichment_result.profiles)}")
-    print(f"Failed: {len(enrichment_result.failed_profiles)}")
+    print(f"Reference profiles parsed: {len(enrichment_result.profiles)}")
+    print(f"Apify failures: {len(enrichment_result.failed_profiles)}")
 
     if enrichment_result.failed_profiles:
         print()
@@ -79,76 +84,59 @@ def main() -> int:
 
     if not enrichment_result.profiles:
         print()
-        print("No successful Apify profiles available for AI analysis.")
-        summary = _analysis_summary_payload(
-            profiles_received_from_apify=len(enrichment_result.profiles),
-            apify_failures=len(enrichment_result.failed_profiles),
-            sent_to_llm=0,
-            analyzed_successfully=0,
-            llm_failures=0,
-        )
-        _print_analysis_summary(summary=summary, analysis_failures=[])
-        if not _save_results_or_report_error(
-            analyzed_candidates=[],
-            apify_failures=enrichment_result.failed_profiles,
-            analysis_failures=[],
-            summary=summary,
-        ):
-            return 1
-        return 0
+        print("Ошибка: нет успешных эталонных профилей для построения портрета.")
+        return 1
 
     llm_config_error = _validate_llm_configuration()
     if llm_config_error is not None:
         print(f"LLM configuration error: {llm_config_error}")
         return 1
 
-    ideal_profile = build_ideal_blogger_profile()
-    prompt_builder = PromptBuilder()
-    llm_service = LLMService(
+    if len(enrichment_result.profiles) < MIN_RECOMMENDED_REFERENCE_PROFILES:
+        print(
+            "Warning: reference sample is small; "
+            f"recommended at least {MIN_RECOMMENDED_REFERENCE_PROFILES} profiles."
+        )
+
+    print(f"Building ideal blogger profile from {len(enrichment_result.profiles)} profiles...")
+
+    ideal_profile_service = IdealProfileService(
+        prompt_builder=IdealProfilePromptBuilder(),
         api_key=settings.openai_api_key or "",
         base_url=settings.openai_base_url,
         model=settings.openai_model,
         timeout=settings.openai_request_timeout_seconds,
     )
-    matcher_service = MatcherService(
-        prompt_builder=prompt_builder,
-        llm_service=llm_service,
-    )
 
-    analyzed_candidates: list[AnalyzedCandidate] = []
-    analysis_failures: list[tuple[BloggerProfile, str]] = []
-
-    for blogger in enrichment_result.profiles:
-        try:
-            analyzed_candidate = matcher_service.match_candidate(
-                ideal_profile=ideal_profile,
-                blogger=blogger,
-            )
-        except LLMServiceError as e:
-            analysis_failures.append((blogger, str(e)))
-            continue
-
-        analyzed_candidates.append(analyzed_candidate)
-        _print_analyzed_candidate(analyzed_candidate)
-
-    summary = _analysis_summary_payload(
-        profiles_received_from_apify=len(enrichment_result.profiles),
-        apify_failures=len(enrichment_result.failed_profiles),
-        sent_to_llm=len(enrichment_result.profiles),
-        analyzed_successfully=len(analyzed_candidates),
-        llm_failures=len(analysis_failures),
-    )
-    _print_analysis_summary(summary=summary, analysis_failures=analysis_failures)
-
-    if not _save_results_or_report_error(
-        analyzed_candidates=analyzed_candidates,
-        apify_failures=enrichment_result.failed_profiles,
-        analysis_failures=analysis_failures,
-        summary=summary,
-    ):
+    try:
+        profile_analysis = ideal_profile_service.build_ideal_profile(enrichment_result.profiles)
+    except IdealProfileServiceError as e:
+        print(f"Ошибка: {e}")
         return 1
 
-    if not analyzed_candidates and analysis_failures:
+    print("Ideal blogger profile created.")
+    print(f"Confidence: {profile_analysis.confidence}")
+    print(f"Niche: {_display(profile_analysis.ideal_profile.niche)}")
+    print(
+        "Followers: "
+        f"{_followers_range(profile_analysis.ideal_profile.min_followers, profile_analysis.ideal_profile.max_followers)}"
+    )
+    _print_key_selection_criteria(profile_analysis)
+
+    summary = _ideal_profile_summary_payload(
+        profiles_requested=len(limited_urls),
+        profiles_analyzed=len(enrichment_result.profiles),
+        apify_failures=len(enrichment_result.failed_profiles),
+    )
+
+    if len(enrichment_result.profiles) < MIN_RECOMMENDED_REFERENCE_PROFILES:
+        _ensure_small_sample_limitation(profile_analysis, len(enrichment_result.profiles))
+
+    if not _save_ideal_profile_or_report_error(
+        profile_analysis=profile_analysis,
+        apify_failures=enrichment_result.failed_profiles,
+        summary=summary,
+    ):
         return 1
 
     return 0
@@ -219,8 +207,6 @@ def save_analysis_results(
     summary: dict[str, int],
     output_path: Path = ANALYSIS_RESULTS_PATH,
 ) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = output_path.with_name(f"{output_path.name}.tmp")
     payload = {
         "generated_at": _generated_at(),
         "summary": summary,
@@ -230,21 +216,29 @@ def save_analysis_results(
     }
 
     try:
-        with temp_path.open("w", encoding="utf-8") as file:
-            json.dump(
-                payload,
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
-            file.write("\n")
-        temp_path.replace(output_path)
-    except Exception as exc:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        atomic_write_json(payload, output_path)
+    except AtomicJsonWriteError as exc:
         raise AnalysisResultsSaveError("Не удалось сохранить результаты анализа.") from exc
+
+
+def save_ideal_profile_results(
+    *,
+    profile_analysis: IdealProfileAnalysis,
+    apify_failures: list[FailedProfile],
+    summary: dict[str, int],
+    output_path: Path = IDEAL_PROFILE_RESULTS_PATH,
+) -> None:
+    payload = {
+        "generated_at": _generated_at(),
+        "summary": summary,
+        "profile_analysis": profile_analysis.model_dump(mode="json"),
+        "apify_failures": [failed_profile.model_dump(mode="json") for failed_profile in apify_failures],
+    }
+
+    try:
+        atomic_write_json(payload, output_path)
+    except AtomicJsonWriteError as exc:
+        raise IdealProfileResultsSaveError("Не удалось сохранить портрет идеального блогера.") from exc
 
 
 def _save_results_or_report_error(
@@ -270,6 +264,27 @@ def _save_results_or_report_error(
     return True
 
 
+def _save_ideal_profile_or_report_error(
+    *,
+    profile_analysis: IdealProfileAnalysis,
+    apify_failures: list[FailedProfile],
+    summary: dict[str, int],
+) -> bool:
+    try:
+        save_ideal_profile_results(
+            profile_analysis=profile_analysis,
+            apify_failures=apify_failures,
+            summary=summary,
+        )
+    except IdealProfileResultsSaveError as e:
+        logger.error("Ideal profile results save failed: error_type=%s", type(e.__cause__).__name__)
+        print(f"Ошибка: {e}")
+        return False
+
+    print("Ideal blogger profile saved to results/ideal_blogger_profile.json")
+    return True
+
+
 def _analysis_summary_payload(
     *,
     profiles_received_from_apify: int,
@@ -284,6 +299,19 @@ def _analysis_summary_payload(
         "sent_to_llm": sent_to_llm,
         "analyzed_successfully": analyzed_successfully,
         "llm_failures": llm_failures,
+    }
+
+
+def _ideal_profile_summary_payload(
+    *,
+    profiles_requested: int,
+    profiles_analyzed: int,
+    apify_failures: int,
+) -> dict[str, int]:
+    return {
+        "profiles_requested": profiles_requested,
+        "profiles_analyzed": profiles_analyzed,
+        "apify_failures": apify_failures,
     }
 
 
@@ -305,6 +333,25 @@ def _llm_failure_payload(blogger: BloggerProfile, error_message: str) -> dict[st
 
 def _generated_at() -> str:
     return datetime.now().astimezone().isoformat()
+
+
+def _ensure_small_sample_limitation(profile_analysis: IdealProfileAnalysis, profiles_count: int) -> None:
+    limitation = (
+        f"Выборка содержит только {profiles_count} профиль; "
+        f"для более надежного портрета рекомендуется минимум {MIN_RECOMMENDED_REFERENCE_PROFILES} профиля."
+    )
+    if limitation not in profile_analysis.data_limitations:
+        profile_analysis.data_limitations.append(limitation)
+
+
+def _print_key_selection_criteria(profile_analysis: IdealProfileAnalysis) -> None:
+    criteria = profile_analysis.important_selection_criteria[:5]
+    if not criteria:
+        return
+
+    print("Key selection criteria:")
+    for criterion in criteria:
+        print(f"- {criterion}")
 
 
 def _print_analysis_summary(
@@ -331,6 +378,16 @@ def _display(value: object) -> object:
     if value is None or value == "":
         return "-"
     return value
+
+
+def _followers_range(min_followers: int | None, max_followers: int | None) -> str:
+    if min_followers is None and max_followers is None:
+        return "-"
+    if min_followers is not None and max_followers is not None:
+        return f"{min_followers} - {max_followers}"
+    if min_followers is not None:
+        return f"From {min_followers}"
+    return f"Up to {max_followers}"
 
 
 def _failed_profile_line(failed_profile: FailedProfile) -> str:

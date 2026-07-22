@@ -2,6 +2,8 @@ from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.blogger import BloggerProfile
 from src.models.candidate_analysis import CandidateAnalysis
 from src.models.ideal_blogger_profile import IdealBloggerProfile
+from src.models.ideal_profile_analysis import IdealProfileAnalysis
+from pydantic import ValidationError
 
 
 def test_create_ideal_blogger_profile() -> None:
@@ -79,6 +81,60 @@ def test_nested_models_are_preserved() -> None:
     assert candidate.analysis.confidence == 0.88
 
 
+def test_create_ideal_profile_analysis() -> None:
+    analysis = _ideal_profile_analysis()
+
+    assert analysis.ideal_profile.niche == "лайфстайл"
+    assert analysis.source_profiles_count == 3
+    assert analysis.common_traits == ["естественная коммуникация"]
+    assert analysis.confidence == 72.0
+
+
+def test_ideal_profile_analysis_rejects_non_positive_source_profiles_count() -> None:
+    try:
+        IdealProfileAnalysis(
+            ideal_profile=IdealBloggerProfile(niche="beauty"),
+            source_profiles_count=0,
+            explanation="Недостаточно данных.",
+            confidence=50.0,
+        )
+    except ValidationError as exc:
+        assert "source_profiles_count" in str(exc)
+    else:
+        raise AssertionError("IdealProfileAnalysis accepted an empty source profile count.")
+
+
+def test_ideal_profile_analysis_rejects_confidence_outside_project_range() -> None:
+    try:
+        IdealProfileAnalysis(
+            ideal_profile=IdealBloggerProfile(niche="beauty"),
+            source_profiles_count=1,
+            explanation="Недостаточно данных.",
+            confidence=101.0,
+        )
+    except ValidationError as exc:
+        assert "confidence" in str(exc)
+    else:
+        raise AssertionError("IdealProfileAnalysis accepted confidence above 100.")
+
+
+def test_ideal_profile_analysis_accepts_russian_text_and_ignores_extra_fields() -> None:
+    analysis = IdealProfileAnalysis(
+        ideal_profile=IdealBloggerProfile(niche="бьюти"),
+        source_profiles_count=1,
+        common_traits=["Мягкий деловой тон"],
+        important_selection_criteria=["Нет спорных тем"],
+        observed_variations=["Разный размер аудитории"],
+        data_limitations=["Нет данных о возрасте аудитории"],
+        explanation="Русский текст сохраняется корректно.",
+        confidence=45.0,
+        unexpected_field="ignored",
+    )
+
+    assert analysis.explanation == "Русский текст сохраняется корректно."
+    assert not hasattr(analysis, "unexpected_field")
+
+
 def _blogger_profile() -> BloggerProfile:
     return BloggerProfile(
         input_url="https://www.instagram.com/creator/",
@@ -111,4 +167,20 @@ def _candidate_analysis() -> CandidateAnalysis:
         recommendation="shortlist",
         explanation="Strong topical fit.",
         confidence=0.88,
+    )
+
+
+def _ideal_profile_analysis() -> IdealProfileAnalysis:
+    return IdealProfileAnalysis(
+        ideal_profile=IdealBloggerProfile(
+            niche="лайфстайл",
+            required_topics=["повседневный стиль"],
+        ),
+        source_profiles_count=3,
+        common_traits=["естественная коммуникация"],
+        important_selection_criteria=["безопасный контент"],
+        observed_variations=["разные категории аккаунтов"],
+        data_limitations=["нет Instagram Insights"],
+        explanation="Портрет построен по общей выборке.",
+        confidence=72.0,
     )
