@@ -3,6 +3,7 @@ __pycache__/
 **/__pycache__/
 *.py[cod]
 *.log
+.pytest_cache/
 
 .env
 credentials.json
@@ -16,3 +17,5 @@ data/*
 
 results/*
 !results/.gitkeep
+
+google_sheets_reference.py
