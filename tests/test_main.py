@@ -11,9 +11,11 @@ from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.apify_enrichment_result import ApifyEnrichmentResult
 from src.models.blogger import BloggerProfile
 from src.models.candidate_analysis import CandidateAnalysis
+from src.models.discovery import DiscoveryCandidate, DiscoveryResult
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
 from src.models.ideal_profile_analysis import IdealProfileAnalysis
+from src.services.discovery_service import DiscoveryServiceError
 from src.services.ideal_profile_service import IdealProfileServiceError
 
 
@@ -50,6 +52,13 @@ def test_main_builds_ideal_profile_from_reference_profiles(
     assert "Ideal blogger profile created." in output
     assert "Ideal blogger profile saved to results/ideal_blogger_profile.json" in output
     assert "Candidate:" not in output
+    assert len(state.discovery_instances) == 1
+    assert state.discovery_instances[0].calls == [
+        (
+            _ideal_profile_analysis(source_profiles_count=3).ideal_profile,
+            {"first", "second", "third"},
+        )
+    ]
 
 
 def test_main_builds_profile_from_partial_apify_success_and_saves_failures(
@@ -202,6 +211,88 @@ def test_main_does_not_create_candidate_analysis_results_for_reference_profiles(
     assert state.matcher_instances == []
 
 
+def test_main_saves_discovered_candidates_after_ideal_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    discovery_output_path = tmp_path / "discovered_candidates.json"
+    discovery_result = _discovery_result()
+    _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        discovery_result=discovery_result,
+        discovery_output_path=discovery_output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+    payload = json.loads(discovery_output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload == discovery_result.model_dump(mode="json")
+    assert "Discovery search queries: 1" in output
+    assert "Discovered unique candidates: 1" in output
+    assert "Discovered candidates saved to results/discovered_candidates.json" in output
+
+
+def test_main_returns_error_when_discovery_configuration_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        settings=_settings(brave_search_api_key=""),
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert state.discovery_instances == []
+    assert "BRAVE_SEARCH_API_KEY не задан" in output
+
+
+def test_main_returns_error_when_discovery_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        discovery_error=DiscoveryServiceError("Не удалось выполнить ни один поисковый запрос Brave Search."),
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert len(state.discovery_instances) == 1
+    assert "Ошибка: Не удалось выполнить ни один поисковый запрос Brave Search." in output
+
+
+def test_main_returns_error_when_discovery_results_cannot_be_saved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("creator")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        discovery_save_error=main_module.DiscoveryResultsSaveError("Не удалось сохранить найденных кандидатов."),
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Ошибка: Не удалось сохранить найденных кандидатов." in output
+
+
 def test_build_ideal_blogger_profile_returns_mvp_profile_with_independent_lists() -> None:
     first_profile = main_module.build_ideal_blogger_profile()
     second_profile = main_module.build_ideal_blogger_profile()
@@ -334,19 +425,35 @@ def test_save_ideal_profile_results_removes_temp_file_on_write_error(
     assert not output_path.with_name("ideal_blogger_profile.json.tmp").exists()
 
 
+def test_save_discovery_results_creates_serializable_json(tmp_path) -> None:
+    output_path = tmp_path / "discovered_candidates.json"
+    discovery_result = _discovery_result()
+
+    main_module.save_discovery_results(discovery_result, output_path=output_path)
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+    assert payload == discovery_result.model_dump(mode="json")
+
+
 def _patch_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     apify_result: ApifyEnrichmentResult,
     profile_analysis: IdealProfileAnalysis | None = None,
     profile_error: Exception | None = None,
+    discovery_result: DiscoveryResult | None = None,
+    discovery_error: Exception | None = None,
     settings: SimpleNamespace | None = None,
     output_path=None,
     analysis_output_path=None,
+    discovery_output_path=None,
     save_error: Exception | None = None,
+    discovery_save_error: Exception | None = None,
 ) -> SimpleNamespace:
     state = SimpleNamespace(
         ideal_profile_instances=[],
         matcher_instances=[],
+        discovery_instances=[],
     )
 
     class FakeSheetsService:
@@ -388,12 +495,38 @@ def _patch_pipeline(
         def __init__(self, **kwargs: Any) -> None:
             state.matcher_instances.append(self)
 
+    class FakeDiscoveryQueryBuilder:
+        pass
+
+    class FakeBraveSearchClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class FakeDiscoveryService:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.calls: list[tuple[IdealBloggerProfile, set[str]]] = []
+            state.discovery_instances.append(self)
+
+        def discover(
+            self,
+            ideal_profile: IdealBloggerProfile,
+            reference_usernames: set[str],
+        ) -> DiscoveryResult:
+            self.calls.append((ideal_profile, reference_usernames))
+            if discovery_error is not None:
+                raise discovery_error
+            return discovery_result or _discovery_result()
+
     monkeypatch.setattr(main_module, "settings", settings or _settings())
     monkeypatch.setattr(main_module, "SheetsService", FakeSheetsService)
     monkeypatch.setattr(main_module, "ApifyService", FakeApifyService)
     monkeypatch.setattr(main_module, "IdealProfilePromptBuilder", FakeIdealProfilePromptBuilder)
     monkeypatch.setattr(main_module, "IdealProfileService", FakeIdealProfileService)
     monkeypatch.setattr(main_module, "MatcherService", FakeMatcherService, raising=False)
+    monkeypatch.setattr(main_module, "DiscoveryQueryBuilder", FakeDiscoveryQueryBuilder)
+    monkeypatch.setattr(main_module, "BraveSearchClient", FakeBraveSearchClient)
+    monkeypatch.setattr(main_module, "DiscoveryService", FakeDiscoveryService)
 
     original_save_ideal_profile_results = main_module.save_ideal_profile_results
 
@@ -405,6 +538,17 @@ def _patch_pipeline(
             original_save_ideal_profile_results(**kwargs)
 
     monkeypatch.setattr(main_module, "save_ideal_profile_results", fake_save_ideal_profile_results)
+
+    original_save_discovery_results = main_module.save_discovery_results
+
+    def fake_save_discovery_results(discovery_result: DiscoveryResult, output_path=main_module.DISCOVERED_CANDIDATES_PATH) -> None:
+        if discovery_save_error is not None:
+            raise discovery_save_error
+        if discovery_output_path is not None:
+            output_path = discovery_output_path
+            original_save_discovery_results(discovery_result, output_path=output_path)
+
+    monkeypatch.setattr(main_module, "save_discovery_results", fake_save_discovery_results)
 
     if analysis_output_path is not None:
         original_save_analysis_results = main_module.save_analysis_results
@@ -418,7 +562,10 @@ def _patch_pipeline(
     return state
 
 
-def _settings(openai_api_key: str | None = "test-openai-key") -> SimpleNamespace:
+def _settings(
+    openai_api_key: str | None = "test-openai-key",
+    brave_search_api_key: str = "test-brave-key",
+) -> SimpleNamespace:
     return SimpleNamespace(
         GOOGLE_SERVICE_ACCOUNT_FILE="service_account.json",
         GOOGLE_SPREADSHEET_ID="spreadsheet-id",
@@ -432,6 +579,7 @@ def _settings(openai_api_key: str | None = "test-openai-key") -> SimpleNamespace
         openai_base_url="https://api.proxyapi.ru/openai/v1",
         openai_model="gpt-5-mini",
         openai_request_timeout_seconds=120,
+        BRAVE_SEARCH_API_KEY=brave_search_api_key,
     )
 
 
@@ -488,4 +636,20 @@ def _candidate_analysis(recommendation: str = "Suitable") -> CandidateAnalysis:
         recommendation=recommendation,
         explanation="Compact test explanation.",
         confidence=0.86,
+    )
+
+
+def _discovery_result() -> DiscoveryResult:
+    return DiscoveryResult(
+        queries=['site:instagram.com "бьюти" блогер Россия'],
+        candidates=[
+            DiscoveryCandidate(
+                username="new_creator",
+                profile_url="https://www.instagram.com/new_creator/",
+                source_query='site:instagram.com "бьюти" блогер Россия',
+                title="New Creator",
+                description="Описание на русском",
+            )
+        ],
+        total_candidates=1,
     )

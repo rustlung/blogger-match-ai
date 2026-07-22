@@ -53,6 +53,7 @@ class Settings:
     GOOGLE_RESULTS_SHEET: str = os.getenv("GOOGLE_RESULTS_SHEET", "Results")
 
     SEARCH_API_KEY: str = os.getenv("SEARCH_API_KEY", "")
+    BRAVE_SEARCH_API_KEY: str = os.getenv("BRAVE_SEARCH_API_KEY", "")
     SEARCH_ENGINE_ID: str = os.getenv("SEARCH_ENGINE_ID", "")
 
 

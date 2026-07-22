@@ -5,10 +5,14 @@ from pathlib import Path
 from src.config import settings
 from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.blogger import BloggerProfile
+from src.models.discovery import DiscoveryResult
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
 from src.models.ideal_profile_analysis import IdealProfileAnalysis
 from src.services.apify_service import ApifyService, ApifyServiceError
+from src.services.brave_search_client import BraveSearchClient
+from src.services.discovery_query_builder import DiscoveryQueryBuilder
+from src.services.discovery_service import DiscoveryService, DiscoveryServiceError, reference_usernames_from_urls
 from src.services.ideal_profile_prompt_builder import IdealProfilePromptBuilder
 from src.services.ideal_profile_service import IdealProfileService, IdealProfileServiceError
 from src.services.sheets_service import SheetsService, SheetsServiceError
@@ -18,6 +22,7 @@ from src.utils.logger import logger
 
 ANALYSIS_RESULTS_PATH = Path("results/analysis_results.json")
 IDEAL_PROFILE_RESULTS_PATH = Path("results/ideal_blogger_profile.json")
+DISCOVERED_CANDIDATES_PATH = Path("results/discovered_candidates.json")
 MIN_RECOMMENDED_REFERENCE_PROFILES = 3
 
 
@@ -26,6 +31,10 @@ class AnalysisResultsSaveError(RuntimeError):
 
 
 class IdealProfileResultsSaveError(RuntimeError):
+    pass
+
+
+class DiscoveryResultsSaveError(RuntimeError):
     pass
 
 
@@ -139,6 +148,36 @@ def main() -> int:
     ):
         return 1
 
+    discovery_config_error = _validate_discovery_configuration()
+    if discovery_config_error is not None:
+        print(f"Discovery configuration error: {discovery_config_error}")
+        return 1
+
+    reference_usernames = _reference_usernames(
+        reference_urls=limited_urls,
+        reference_profiles=enrichment_result.profiles,
+    )
+    discovery_service = DiscoveryService(
+        query_builder=DiscoveryQueryBuilder(),
+        search_client=BraveSearchClient(api_key=settings.BRAVE_SEARCH_API_KEY),
+    )
+
+    try:
+        discovery_result = discovery_service.discover(
+            ideal_profile=profile_analysis.ideal_profile,
+            reference_usernames=reference_usernames,
+        )
+    except DiscoveryServiceError as e:
+        print(f"Ошибка: {e}")
+        return 1
+
+    if not _save_discovery_results_or_report_error(discovery_result):
+        return 1
+
+    print(f"Discovery search queries: {len(discovery_result.queries)}")
+    print(f"Discovered unique candidates: {discovery_result.total_candidates}")
+    print("Discovered candidates saved to results/discovered_candidates.json")
+
     return 0
 
 
@@ -169,6 +208,13 @@ def _validate_llm_configuration() -> str | None:
 
     if settings.openai_request_timeout_seconds <= 0:
         return "OPENAI_REQUEST_TIMEOUT_SECONDS must be greater than 0."
+
+    return None
+
+
+def _validate_discovery_configuration() -> str | None:
+    if not settings.BRAVE_SEARCH_API_KEY:
+        return "BRAVE_SEARCH_API_KEY не задан."
 
     return None
 
@@ -241,6 +287,16 @@ def save_ideal_profile_results(
         raise IdealProfileResultsSaveError("Не удалось сохранить портрет идеального блогера.") from exc
 
 
+def save_discovery_results(
+    discovery_result: DiscoveryResult,
+    output_path: Path = DISCOVERED_CANDIDATES_PATH,
+) -> None:
+    try:
+        atomic_write_json(discovery_result.model_dump(mode="json"), output_path)
+    except AtomicJsonWriteError as exc:
+        raise DiscoveryResultsSaveError("Не удалось сохранить найденных кандидатов.") from exc
+
+
 def _save_results_or_report_error(
     *,
     analyzed_candidates: list[AnalyzedCandidate],
@@ -282,6 +338,17 @@ def _save_ideal_profile_or_report_error(
         return False
 
     print("Ideal blogger profile saved to results/ideal_blogger_profile.json")
+    return True
+
+
+def _save_discovery_results_or_report_error(discovery_result: DiscoveryResult) -> bool:
+    try:
+        save_discovery_results(discovery_result)
+    except DiscoveryResultsSaveError as e:
+        logger.error("Discovery results save failed: error_type=%s", type(e.__cause__).__name__)
+        print(f"Ошибка: {e}")
+        return False
+
     return True
 
 
@@ -329,6 +396,14 @@ def _llm_failure_payload(blogger: BloggerProfile, error_message: str) -> dict[st
         "profile_url": blogger.profile_url or blogger.input_url,
         "error": error_message,
     }
+
+
+def _reference_usernames(reference_urls: list[str], reference_profiles: list[BloggerProfile]) -> set[str]:
+    usernames = reference_usernames_from_urls(reference_urls)
+    for profile in reference_profiles:
+        if profile.username:
+            usernames.add(profile.username.casefold())
+    return usernames
 
 
 def _generated_at() -> str:
