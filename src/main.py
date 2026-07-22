@@ -1,5 +1,7 @@
+import builtins
 import sys
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 from src.config import settings
@@ -48,6 +50,7 @@ DISCOVERED_PROFILES_PATH = Path("results/discovered_profiles.json")
 MATCH_RESULTS_PATH = Path("results/match_results.json")
 PERSONALIZED_OFFERS_PATH = Path("results/personalized_offers.json")
 MIN_RECOMMENDED_REFERENCE_PROFILES = 3
+print = partial(builtins.print, flush=True)
 
 
 class AnalysisResultsSaveError(RuntimeError):

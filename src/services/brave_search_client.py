@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -11,6 +12,10 @@ BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
 
 class BraveSearchClientError(RuntimeError):
+    pass
+
+
+class BraveSearchHttpError(BraveSearchClientError):
     pass
 
 
@@ -43,17 +48,39 @@ class BraveSearchClient:
         except httpx.RequestError as exc:
             raise BraveSearchClientError("Brave Search network request failed.") from exc
 
-        if response.status_code >= 400:
-            raise BraveSearchClientError(_http_error_message(response.status_code))
-
         try:
             data = response.json()
         except ValueError as exc:
+            _log_response_diagnostics(
+                query=query,
+                status_code=response.status_code,
+                data=None,
+                response_text=_response_text(response),
+            )
             raise BraveSearchClientError("Brave Search returned invalid JSON.") from exc
+
+        if not isinstance(data, dict):
+            _log_response_diagnostics(
+                query=query,
+                status_code=response.status_code,
+                data=None,
+                response_text=str(data)[:1000],
+            )
+            raise BraveSearchClientError("Brave Search returned unexpected JSON shape.")
+
+        _log_response_diagnostics(
+            query=query,
+            status_code=response.status_code,
+            data=data,
+            response_text=_safe_json_fragment(data),
+        )
+
+        if not 200 <= response.status_code < 300:
+            raise BraveSearchHttpError(_http_error_message(response.status_code))
 
         web_results = data.get("web")
         if web_results is None:
-            logger.warning("Brave Search response has no web results block.")
+            _log_missing_web_block(data)
             return []
 
         results = web_results.get("results")
@@ -85,3 +112,66 @@ def _http_error_message(status_code: int) -> str:
         return f"Brave Search временно недоступен или вернул серверную ошибку (HTTP {status_code})."
 
     return f"Brave Search returned HTTP {status_code}."
+
+
+def _log_response_diagnostics(
+    *,
+    query: str,
+    status_code: int,
+    data: dict[str, Any] | None,
+    response_text: str,
+) -> None:
+    logger.info(
+        "Brave Search response diagnostics: query=%s status=%s web_results_count=%s",
+        query,
+        status_code,
+        _web_results_count(data),
+    )
+
+    if data is not None and data.get("web") is None:
+        _log_missing_web_details(data, response_text)
+
+
+def _log_missing_web_block(data: dict[str, Any]) -> None:
+    logger.warning("Brave Search response has no web results block.")
+
+
+def _log_missing_web_details(data: dict[str, Any], response_text: str) -> None:
+    logger.warning(
+        "Brave Search missing web diagnostics: top_level_keys=%s has_error=%s has_message=%s has_code=%s has_detail=%s response_fragment=%s",
+        sorted(str(key) for key in data.keys()),
+        "error" in data,
+        "message" in data,
+        "code" in data,
+        "detail" in data,
+        response_text[:1000],
+    )
+
+
+def _web_results_count(data: dict[str, Any] | None) -> int | str:
+    if data is None:
+        return "unknown"
+
+    web = data.get("web")
+    if not isinstance(web, dict):
+        return 0
+
+    results = web.get("results")
+    if isinstance(results, list):
+        return len(results)
+
+    return 0
+
+
+def _response_text(response: Any) -> str:
+    text = getattr(response, "text", "")
+    if not isinstance(text, str):
+        return ""
+    return text[:1000]
+
+
+def _safe_json_fragment(data: dict[str, Any]) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False, default=str)[:1000]
+    except (TypeError, ValueError):
+        return str(data)[:1000]
