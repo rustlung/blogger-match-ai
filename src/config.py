@@ -47,7 +47,9 @@ class Settings:
         "GOOGLE_SERVICE_ACCOUNT_FILE",
         "service_account.json",
     )
+    GOOGLE_SERVICE_ACCOUNT_JSON: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     GOOGLE_SPREADSHEET_ID: str = os.getenv("GOOGLE_SPREADSHEET_ID", "")
+    GOOGLE_SHEET_URL: str = os.getenv("GOOGLE_SHEET_URL", "")
     GOOGLE_SOURCE_SHEET: str = os.getenv("GOOGLE_SOURCE_SHEET", "Input")
     GOOGLE_SOURCE_COLUMN: str = os.getenv("GOOGLE_SOURCE_COLUMN", "B")
     GOOGLE_RESULTS_SHEET: str = os.getenv("GOOGLE_RESULTS_SHEET", "Results")

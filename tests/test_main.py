@@ -354,6 +354,45 @@ def test_main_saves_personalized_offers_after_batch_matcher(
     assert "Personalized offers saved to results/personalized_offers.json" in output
 
 
+def test_main_exports_results_to_google_sheets_after_personalized_offers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference_profile = _blogger("reference")
+    candidate_profile = _blogger("export_creator")
+    profile_analysis = _ideal_profile_analysis(source_profiles_count=1)
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[reference_profile]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[candidate_profile]),
+        profile_analysis=profile_analysis,
+    )
+
+    exit_code = main_module.main()
+
+    assert exit_code == 0
+    assert len(state.export_instances) == 1
+    export_call = state.export_instances[0].calls[0]
+    assert export_call["reference_profiles_result"] == ApifyEnrichmentResult(profiles=[reference_profile])
+    assert export_call["profile_analysis"] is profile_analysis
+    assert export_call["discovered_profiles_result"] == ApifyEnrichmentResult(profiles=[candidate_profile])
+    assert export_call["match_result"] == BatchMatchResult(
+        matches=[_match_result("export_creator")],
+        errors=[],
+        total_candidates=1,
+        successful_matches=1,
+        failed_matches=0,
+    )
+    assert export_call["personalized_offer_result"] == BatchPersonalizedOfferResult(
+        offers=[_offer("export_creator")],
+        errors=[],
+        total_matches=1,
+        eligible_candidates=1,
+        skipped_rejected=0,
+        successful_offers=1,
+        failed_offers=0,
+    )
+
+
 def test_main_all_rejected_personalized_offers_is_successful_empty_runtime_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -798,6 +837,7 @@ def _patch_pipeline(
     offer_result: BatchPersonalizedOfferResult | None = None,
     offer_error: Exception | None = None,
     offer_save_error: Exception | None = None,
+    export_error: Exception | None = None,
 ) -> SimpleNamespace:
     state = SimpleNamespace(
         apify_load_calls=[],
@@ -806,6 +846,7 @@ def _patch_pipeline(
         batch_matcher_instances=[],
         personalized_offer_instances=[],
         batch_offer_instances=[],
+        export_instances=[],
         discovery_instances=[],
     )
 
@@ -925,6 +966,17 @@ def _patch_pipeline(
                 failed_offers=0,
             )
 
+    class FakeExportService:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.calls: list[dict[str, Any]] = []
+            state.export_instances.append(self)
+
+        def export_results(self, **kwargs: Any) -> None:
+            self.calls.append(kwargs)
+            if export_error is not None:
+                raise export_error
+
     class FakeDiscoveryQueryBuilder:
         pass
 
@@ -961,6 +1013,7 @@ def _patch_pipeline(
     monkeypatch.setattr(main_module, "PersonalizedOfferPromptBuilder", FakePersonalizedOfferPromptBuilder)
     monkeypatch.setattr(main_module, "PersonalizedOfferService", FakePersonalizedOfferService)
     monkeypatch.setattr(main_module, "BatchPersonalizedOfferService", FakeBatchPersonalizedOfferService)
+    monkeypatch.setattr(main_module, "ExportService", FakeExportService)
     monkeypatch.setattr(main_module, "DiscoveryQueryBuilder", FakeDiscoveryQueryBuilder)
     monkeypatch.setattr(main_module, "BraveSearchClient", FakeBraveSearchClient)
     monkeypatch.setattr(main_module, "DiscoveryService", FakeDiscoveryService)

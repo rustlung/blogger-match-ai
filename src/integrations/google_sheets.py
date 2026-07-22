@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 from typing import Any
 
 import gspread
@@ -113,9 +115,19 @@ class GoogleSheetsClient:
         scopes: list[str] | None = None,
     ) -> GoogleSheetsClient:
         try:
-            creds = Credentials.from_service_account_file(path, scopes=scopes or _DEFAULT_SCOPES)
+            service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+            if service_account_json:
+                service_account_info = json.loads(service_account_json)
+                creds = Credentials.from_service_account_info(
+                    service_account_info,
+                    scopes=scopes or _DEFAULT_SCOPES,
+                )
+            else:
+                creds = Credentials.from_service_account_file(path, scopes=scopes or _DEFAULT_SCOPES)
             client = gspread.authorize(creds)
             return cls(client, creds=creds)
+        except json.JSONDecodeError as e:
+            raise SheetsAuthError("Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON.") from e
         except DefaultCredentialsError as e:
             raise SheetsAuthError(f"Failed to load service account: {e}") from e
         except Exception as e:
@@ -144,6 +156,10 @@ class Spreadsheet:
             raise WorksheetNotFound(f"Worksheet not found: {title!r}")
 
     @_wrap_api
+    def add_worksheet(self, title: str, rows: int = 100, cols: int = 20) -> Worksheet:
+        return Worksheet(self._gc.add_worksheet(title=title, rows=rows, cols=cols))
+
+    @_wrap_api
     def worksheet_by_index(self, index: int) -> Worksheet:
         try:
             worksheet = self._gc.get_worksheet(index)
@@ -157,12 +173,29 @@ class Spreadsheet:
     def worksheets(self) -> list[Worksheet]:
         return [Worksheet(worksheet) for worksheet in self._gc.worksheets()]
 
+    @_wrap_api
+    def reorder_worksheet(self, worksheet: Worksheet, index: int) -> None:
+        self._gc.reorder_worksheets(
+            sorted(
+                self._gc.worksheets(),
+                key=lambda item: 0 if item.id == worksheet.id and index == 0 else 1,
+            )
+        )
+
 
 class Worksheet:
     """Wrapper for one worksheet with basic range read/write operations."""
 
     def __init__(self, worksheet: gspread.Worksheet) -> None:
         self._ws = worksheet
+
+    @property
+    def id(self) -> int:
+        return self._ws.id
+
+    @property
+    def title(self) -> str:
+        return self._ws.title
 
     @_wrap_api
     def get_values(self, a1_range: str | None = None) -> list[list[str]]:
@@ -204,3 +237,15 @@ class Worksheet:
     @_wrap_api
     def clear_all(self) -> None:
         self._ws.clear()
+
+    @_wrap_api
+    def format_range(self, a1_range: str, cell_format: dict[str, Any]) -> None:
+        self._ws.format(a1_range, cell_format)
+
+    @_wrap_api
+    def freeze_rows(self, rows: int) -> None:
+        self._ws.freeze(rows=rows)
+
+    @_wrap_api
+    def auto_resize_columns(self, start_index: int, end_index: int) -> None:
+        self._ws.columns_auto_resize(start_index, end_index)

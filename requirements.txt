@@ -1,4 +1,5 @@
 apify-client
+fastapi
 google-api-python-client
 google-auth
 google-auth-oauthlib
@@ -10,3 +11,4 @@ pytest
 python-dotenv
 requests
 rich
+uvicorn

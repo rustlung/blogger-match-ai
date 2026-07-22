@@ -27,6 +27,7 @@ from src.services.discovered_profile_enrichment_service import (
     DiscoveredProfileEnrichmentService,
     DiscoveredProfileEnrichmentServiceError,
 )
+from src.services.export_service import ExportService, ExportServiceError
 from src.services.ideal_profile_prompt_builder import IdealProfilePromptBuilder
 from src.services.ideal_profile_service import IdealProfileService, IdealProfileServiceError
 from src.services.llm_service import LLMService
@@ -281,6 +282,28 @@ def main() -> int:
 
     _print_personalized_offer_diagnostics(personalized_offer_result)
     print("Personalized offers saved to results/personalized_offers.json")
+
+    export_service = ExportService(
+        service_account_file=settings.GOOGLE_SERVICE_ACCOUNT_FILE,
+        spreadsheet_id=settings.GOOGLE_SPREADSHEET_ID,
+        source_sheet=settings.GOOGLE_SOURCE_SHEET,
+    )
+
+    try:
+        export_service.export_results(
+            run_at=datetime.now().astimezone(),
+            reference_profiles_result=enrichment_result,
+            profile_analysis=profile_analysis,
+            discovery_result=discovery_result,
+            discovered_profiles_result=discovered_profiles_result,
+            match_result=match_result,
+            personalized_offer_result=personalized_offer_result,
+        )
+    except ExportServiceError as e:
+        print(f"Ошибка: {e}")
+        return 1
+
+    print("Google Sheets export completed.")
 
     return 0
 

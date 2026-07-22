@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlparse
@@ -116,10 +117,11 @@ class SheetsService:
         return extract_instagram_urls_from_column(values)
 
     def _validate_settings(self) -> None:
-        if not self.service_account_file:
+        if _has_service_account_json():
+            pass
+        elif not self.service_account_file:
             raise SheetsServiceError("Не задан GOOGLE_SERVICE_ACCOUNT_FILE.")
-
-        if not Path(self.service_account_file).is_file():
+        elif not Path(self.service_account_file).is_file():
             raise SheetsServiceError("Файл service account не найден.")
 
         if not self.spreadsheet_id:
@@ -139,3 +141,7 @@ def _normalize_username(username: str) -> str | None:
     if not username or not _USERNAME_RE.fullmatch(username):
         return None
     return f"https://www.instagram.com/{username}/"
+
+
+def _has_service_account_json() -> bool:
+    return bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip())
