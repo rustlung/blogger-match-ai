@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src.config import settings
 from src.models.analyzed_candidate import AnalyzedCandidate
+from src.models.apify_enrichment_result import ApifyEnrichmentResult
 from src.models.blogger import BloggerProfile
 from src.models.discovery import DiscoveryResult
 from src.models.failed_profile import FailedProfile
@@ -13,6 +14,10 @@ from src.services.apify_service import ApifyService, ApifyServiceError
 from src.services.brave_search_client import BraveSearchClient
 from src.services.discovery_query_builder import DiscoveryQueryBuilder
 from src.services.discovery_service import DiscoveryService, DiscoveryServiceError, reference_usernames_from_urls
+from src.services.discovered_profile_enrichment_service import (
+    DiscoveredProfileEnrichmentService,
+    DiscoveredProfileEnrichmentServiceError,
+)
 from src.services.ideal_profile_prompt_builder import IdealProfilePromptBuilder
 from src.services.ideal_profile_service import IdealProfileService, IdealProfileServiceError
 from src.services.sheets_service import SheetsService, SheetsServiceError
@@ -23,6 +28,7 @@ from src.utils.logger import logger
 ANALYSIS_RESULTS_PATH = Path("results/analysis_results.json")
 IDEAL_PROFILE_RESULTS_PATH = Path("results/ideal_blogger_profile.json")
 DISCOVERED_CANDIDATES_PATH = Path("results/discovered_candidates.json")
+DISCOVERED_PROFILES_PATH = Path("results/discovered_profiles.json")
 MIN_RECOMMENDED_REFERENCE_PROFILES = 3
 
 
@@ -35,6 +41,10 @@ class IdealProfileResultsSaveError(RuntimeError):
 
 
 class DiscoveryResultsSaveError(RuntimeError):
+    pass
+
+
+class DiscoveredProfilesSaveError(RuntimeError):
     pass
 
 
@@ -77,7 +87,7 @@ def main() -> int:
     )
 
     try:
-        enrichment_result = apify_service.enrich_profiles(limited_urls)
+        enrichment_result = apify_service.load_profiles(limited_urls)
     except ApifyServiceError as e:
         print(f"Ошибка: {e}")
         return 1
@@ -177,6 +187,21 @@ def main() -> int:
     print(f"Discovery search queries: {len(discovery_result.queries)}")
     print(f"Discovered unique candidates: {discovery_result.total_candidates}")
     print("Discovered candidates saved to results/discovered_candidates.json")
+
+    discovered_enrichment_service = DiscoveredProfileEnrichmentService(profile_loader=apify_service)
+    try:
+        discovered_profiles_result = discovered_enrichment_service.enrich_discovered_profiles(discovery_result)
+    except DiscoveredProfileEnrichmentServiceError as e:
+        print(f"Ошибка: {e}")
+        return 1
+
+    if not _save_discovered_profiles_or_report_error(discovered_profiles_result):
+        return 1
+
+    print(f"Candidate URLs found: {discovery_result.total_candidates}")
+    print(f"Candidate profiles loaded successfully: {len(discovered_profiles_result.profiles)}")
+    print(f"Candidate profile load errors: {len(discovered_profiles_result.failed_profiles)}")
+    print("Discovered profiles saved to results/discovered_profiles.json")
 
     return 0
 
@@ -297,6 +322,22 @@ def save_discovery_results(
         raise DiscoveryResultsSaveError("Не удалось сохранить найденных кандидатов.") from exc
 
 
+def save_discovered_profiles(
+    enrichment_result: ApifyEnrichmentResult,
+    output_path: Path = DISCOVERED_PROFILES_PATH,
+) -> None:
+    payload = {
+        "profiles": [_blogger_profile_payload(profile) for profile in enrichment_result.profiles],
+        "failed_profiles": [failed_profile.model_dump(mode="json") for failed_profile in enrichment_result.failed_profiles],
+        "total_profiles": len(enrichment_result.profiles),
+        "failed_profiles_count": len(enrichment_result.failed_profiles),
+    }
+    try:
+        atomic_write_json(payload, output_path)
+    except AtomicJsonWriteError as exc:
+        raise DiscoveredProfilesSaveError("Не удалось сохранить найденные профили.") from exc
+
+
 def _save_results_or_report_error(
     *,
     analyzed_candidates: list[AnalyzedCandidate],
@@ -352,6 +393,17 @@ def _save_discovery_results_or_report_error(discovery_result: DiscoveryResult) -
     return True
 
 
+def _save_discovered_profiles_or_report_error(enrichment_result: ApifyEnrichmentResult) -> bool:
+    try:
+        save_discovered_profiles(enrichment_result)
+    except DiscoveredProfilesSaveError as e:
+        logger.error("Discovered profiles save failed: error_type=%s", type(e.__cause__).__name__)
+        print(f"Ошибка: {e}")
+        return False
+
+    return True
+
+
 def _analysis_summary_payload(
     *,
     profiles_received_from_apify: int,
@@ -383,11 +435,14 @@ def _ideal_profile_summary_payload(
 
 
 def _analyzed_candidate_payload(candidate: AnalyzedCandidate) -> dict[str, object]:
-    blogger_payload = candidate.blogger.model_dump(mode="json", exclude={"raw_data"})
     return {
-        "blogger": blogger_payload,
+        "blogger": _blogger_profile_payload(candidate.blogger),
         "analysis": candidate.analysis.model_dump(mode="json"),
     }
+
+
+def _blogger_profile_payload(profile: BloggerProfile) -> dict[str, object]:
+    return profile.model_dump(mode="json", exclude={"raw_data"})
 
 
 def _llm_failure_payload(blogger: BloggerProfile, error_message: str) -> dict[str, str | None]:

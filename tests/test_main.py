@@ -53,6 +53,14 @@ def test_main_builds_ideal_profile_from_reference_profiles(
     assert "Ideal blogger profile saved to results/ideal_blogger_profile.json" in output
     assert "Candidate:" not in output
     assert len(state.discovery_instances) == 1
+    assert state.apify_load_calls == [
+        [
+            "https://www.instagram.com/first/",
+            "https://www.instagram.com/second/",
+            "https://www.instagram.com/third/",
+        ],
+        ["https://www.instagram.com/new_creator/"],
+    ]
     assert state.discovery_instances[0].calls == [
         (
             _ideal_profile_analysis(source_profiles_count=3).ideal_profile,
@@ -235,6 +243,55 @@ def test_main_saves_discovered_candidates_after_ideal_profile(
     assert "Discovery search queries: 1" in output
     assert "Discovered unique candidates: 1" in output
     assert "Discovered candidates saved to results/discovered_candidates.json" in output
+    assert "Discovered profiles saved to results/discovered_profiles.json" in output
+
+
+def test_main_saves_discovered_profiles_after_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    discovered_profiles_output_path = tmp_path / "discovered_profiles.json"
+    candidate_profile = _blogger("new_creator")
+    _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[candidate_profile]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        discovered_profiles_output_path=discovered_profiles_output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+    payload = json.loads(discovered_profiles_output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload["profiles"][0]["username"] == "new_creator"
+    assert payload["total_profiles"] == 1
+    assert payload["failed_profiles_count"] == 0
+    assert "raw_data" not in payload["profiles"][0]
+    assert "Candidate URLs found: 1" in output
+    assert "Candidate profiles loaded successfully: 1" in output
+    assert "Candidate profile load errors: 0" in output
+
+
+def test_main_returns_error_when_discovered_profiles_cannot_be_saved(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[_blogger("candidate")]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        discovered_profiles_save_error=main_module.DiscoveredProfilesSaveError("Не удалось сохранить найденные профили."),
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Ошибка: Не удалось сохранить найденные профили." in output
 
 
 def test_main_returns_error_when_discovery_configuration_is_missing(
@@ -436,9 +493,36 @@ def test_save_discovery_results_creates_serializable_json(tmp_path) -> None:
     assert payload == discovery_result.model_dump(mode="json")
 
 
+def test_save_discovered_profiles_creates_serializable_json_without_raw_data(tmp_path) -> None:
+    output_path = tmp_path / "discovered_profiles.json"
+    failed_profile = FailedProfile(
+        input_url="https://www.instagram.com/missing/",
+        username="missing",
+        error_code="not_found",
+    )
+
+    main_module.save_discovered_profiles(
+        ApifyEnrichmentResult(
+            profiles=[_blogger("candidate")],
+            failed_profiles=[failed_profile],
+        ),
+        output_path=output_path,
+    )
+
+    raw_text = output_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+
+    assert payload["profiles"][0]["username"] == "candidate"
+    assert "raw_data" not in payload["profiles"][0]
+    assert payload["failed_profiles"] == [failed_profile.model_dump(mode="json")]
+    assert payload["total_profiles"] == 1
+    assert payload["failed_profiles_count"] == 1
+
+
 def _patch_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     apify_result: ApifyEnrichmentResult,
+    candidate_apify_result: ApifyEnrichmentResult | None = None,
     profile_analysis: IdealProfileAnalysis | None = None,
     profile_error: Exception | None = None,
     discovery_result: DiscoveryResult | None = None,
@@ -447,10 +531,13 @@ def _patch_pipeline(
     output_path=None,
     analysis_output_path=None,
     discovery_output_path=None,
+    discovered_profiles_output_path=None,
     save_error: Exception | None = None,
     discovery_save_error: Exception | None = None,
+    discovered_profiles_save_error: Exception | None = None,
 ) -> SimpleNamespace:
     state = SimpleNamespace(
+        apify_load_calls=[],
         ideal_profile_instances=[],
         matcher_instances=[],
         discovery_instances=[],
@@ -471,9 +558,15 @@ def _patch_pipeline(
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
 
-        def enrich_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
+        def load_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
             state.apify_profile_urls = profile_urls
-            return apify_result
+            state.apify_load_calls.append(profile_urls)
+            if len(state.apify_load_calls) == 1:
+                return apify_result
+            return candidate_apify_result or ApifyEnrichmentResult()
+
+        def enrich_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
+            return self.load_profiles(profile_urls)
 
     class FakeIdealProfilePromptBuilder:
         pass
@@ -549,6 +642,17 @@ def _patch_pipeline(
             original_save_discovery_results(discovery_result, output_path=output_path)
 
     monkeypatch.setattr(main_module, "save_discovery_results", fake_save_discovery_results)
+
+    original_save_discovered_profiles = main_module.save_discovered_profiles
+
+    def fake_save_discovered_profiles(enrichment_result: ApifyEnrichmentResult, output_path=main_module.DISCOVERED_PROFILES_PATH) -> None:
+        if discovered_profiles_save_error is not None:
+            raise discovered_profiles_save_error
+        if discovered_profiles_output_path is not None:
+            output_path = discovered_profiles_output_path
+            original_save_discovered_profiles(enrichment_result, output_path=output_path)
+
+    monkeypatch.setattr(main_module, "save_discovered_profiles", fake_save_discovered_profiles)
 
     if analysis_output_path is not None:
         original_save_analysis_results = main_module.save_analysis_results

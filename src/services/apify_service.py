@@ -85,7 +85,7 @@ class ApifyService:
         self.actor_id = actor_id
         self.timeout_seconds = timeout_seconds
 
-    def enrich_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
+    def load_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
         self._validate_settings(profile_urls)
         unique_urls = _unique_non_empty(profile_urls)
         if not unique_urls:
@@ -188,6 +188,9 @@ class ApifyService:
         )
 
         return result
+
+    def enrich_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
+        return self.load_profiles(profile_urls)
 
     def _validate_settings(self, profile_urls: list[str]) -> None:
         if not self.api_token:

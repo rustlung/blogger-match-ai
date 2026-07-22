@@ -259,6 +259,15 @@ def test_apify_service_successful_list_response(monkeypatch: pytest.MonkeyPatch)
     assert result.failed_profiles == []
 
 
+def test_apify_service_load_profiles_is_universal_profile_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_client(monkeypatch, _json_response([{"username": "candidate"}]))
+
+    result = ApifyService("secret", "actor", 300).load_profiles(["https://www.instagram.com/candidate/"])
+
+    assert isinstance(result, ApifyEnrichmentResult)
+    assert [profile.username for profile in result.profiles] == ["candidate"]
+
+
 def test_apify_service_creates_failed_profiles_for_invalid_dataset_items(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
