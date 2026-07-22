@@ -9,7 +9,15 @@ import pytest
 from src import main as main_module
 from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.apify_enrichment_result import ApifyEnrichmentResult
+from src.models.batch_match_result import BatchMatchResult
 from src.models.blogger import BloggerProfile
+from src.models.blogger_match_result import (
+    BloggerMatchResult,
+    MatchCriteriaScores,
+    MatchCriterionScore,
+    MatchDecision,
+    RegionStatus,
+)
 from src.models.candidate_analysis import CandidateAnalysis
 from src.models.discovery import DiscoveryCandidate, DiscoveryResult
 from src.models.failed_profile import FailedProfile
@@ -17,6 +25,7 @@ from src.models.ideal_blogger_profile import IdealBloggerProfile
 from src.models.ideal_profile_analysis import IdealProfileAnalysis
 from src.services.discovery_service import DiscoveryServiceError
 from src.services.ideal_profile_service import IdealProfileServiceError
+from src.services.batch_matcher_service import BatchMatcherServiceError
 
 
 def test_main_builds_ideal_profile_from_reference_profiles(
@@ -42,7 +51,8 @@ def test_main_builds_ideal_profile_from_reference_profiles(
     assert exit_code == 0
     assert len(state.ideal_profile_instances) == 1
     assert state.ideal_profile_instances[0].calls == [[first_profile, second_profile, third_profile]]
-    assert state.matcher_instances == []
+    assert len(state.matcher_instances) == 1
+    assert len(state.batch_matcher_instances) == 1
     assert payload["summary"] == {
         "profiles_requested": 3,
         "profiles_analyzed": 3,
@@ -216,7 +226,7 @@ def test_main_does_not_create_candidate_analysis_results_for_reference_profiles(
     assert exit_code == 0
     assert ideal_output_path.exists()
     assert not analysis_output_path.exists()
-    assert state.matcher_instances == []
+    assert len(state.batch_matcher_instances) == 1
 
 
 def test_main_saves_discovered_candidates_after_ideal_profile(
@@ -273,6 +283,107 @@ def test_main_saves_discovered_profiles_after_discovery(
     assert "Candidate URLs found: 1" in output
     assert "Candidate profiles loaded successfully: 1" in output
     assert "Candidate profile load errors: 0" in output
+
+
+def test_main_saves_match_results_after_discovered_profile_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    match_output_path = tmp_path / "match_results.json"
+    candidate_profile = _blogger("matched_creator")
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[candidate_profile]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        match_output_path=match_output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+    payload = json.loads(match_output_path.read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert payload["matches"][0]["username"] == "matched_creator"
+    assert payload["total_candidates"] == 1
+    assert payload["successful_matches"] == 1
+    assert payload["failed_matches"] == 0
+    assert state.batch_matcher_instances[0].calls == [
+        (_ideal_profile_analysis(source_profiles_count=1).ideal_profile, [candidate_profile])
+    ]
+    assert "Matcher summary" in output
+    assert "Match results saved to results/match_results.json" in output
+
+
+def test_main_uses_in_memory_candidate_profiles_for_batch_matcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_profile = _blogger("memory_candidate")
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(profiles=[candidate_profile]),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+    )
+
+    exit_code = main_module.main()
+
+    assert exit_code == 0
+    _, candidate_profiles = state.batch_matcher_instances[0].calls[0]
+    assert candidate_profiles == [candidate_profile]
+
+
+def test_main_returns_error_without_saving_empty_match_result_when_no_candidates_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    match_output_path = tmp_path / "match_results.json"
+    state = _patch_pipeline(
+        monkeypatch,
+        apify_result=ApifyEnrichmentResult(profiles=[_blogger("reference")]),
+        candidate_apify_result=ApifyEnrichmentResult(),
+        profile_analysis=_ideal_profile_analysis(source_profiles_count=1),
+        match_error=BatchMatcherServiceError("Нет кандидатов для оценки."),
+        match_output_path=match_output_path,
+    )
+
+    exit_code = main_module.main()
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert len(state.batch_matcher_instances) == 1
+    assert not match_output_path.exists()
+    assert "Ошибка: Нет кандидатов для оценки." in output
+
+
+def test_save_match_results_creates_serializable_json(tmp_path) -> None:
+    output_path = tmp_path / "match_results.json"
+    batch_result = BatchMatchResult(
+        matches=[_match_result("creator")],
+        errors=[],
+        total_candidates=1,
+        successful_matches=1,
+        failed_matches=0,
+    )
+
+    main_module.save_match_results(batch_result, output_path=output_path)
+
+    raw_text = output_path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+
+    assert payload == batch_result.model_dump(mode="json")
+    assert "raw_data" not in raw_text
+    assert "prompt" not in raw_text.lower()
+    assert "api_key" not in raw_text.lower()
+
+
+def test_match_results_runtime_file_is_ignored_by_git() -> None:
+    gitignore = main_module.Path(".gitignore").read_text(encoding="utf-8")
+
+    assert "results/*" in gitignore
+    assert "!results/.gitkeep" in gitignore
 
 
 def test_main_returns_error_when_discovered_profiles_cannot_be_saved(
@@ -532,14 +643,19 @@ def _patch_pipeline(
     analysis_output_path=None,
     discovery_output_path=None,
     discovered_profiles_output_path=None,
+    match_output_path=None,
     save_error: Exception | None = None,
     discovery_save_error: Exception | None = None,
     discovered_profiles_save_error: Exception | None = None,
+    match_result: BatchMatchResult | None = None,
+    match_error: Exception | None = None,
+    match_save_error: Exception | None = None,
 ) -> SimpleNamespace:
     state = SimpleNamespace(
         apify_load_calls=[],
         ideal_profile_instances=[],
         matcher_instances=[],
+        batch_matcher_instances=[],
         discovery_instances=[],
     )
 
@@ -563,7 +679,7 @@ def _patch_pipeline(
             state.apify_load_calls.append(profile_urls)
             if len(state.apify_load_calls) == 1:
                 return apify_result
-            return candidate_apify_result or ApifyEnrichmentResult()
+            return candidate_apify_result or ApifyEnrichmentResult(profiles=[_blogger("new_creator")])
 
         def enrich_profiles(self, profile_urls: list[str]) -> ApifyEnrichmentResult:
             return self.load_profiles(profile_urls)
@@ -586,7 +702,42 @@ def _patch_pipeline(
 
     class FakeMatcherService:
         def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
             state.matcher_instances.append(self)
+
+    class FakeLLMService:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class FakePromptBuilder:
+        pass
+
+    class FakeMatcherPromptBuilder:
+        pass
+
+    class FakeBatchMatcherService:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            self.calls: list[tuple[IdealBloggerProfile, list[BloggerProfile]]] = []
+            state.batch_matcher_instances.append(self)
+
+        def match_candidates(
+            self,
+            ideal_profile: IdealBloggerProfile,
+            candidate_profiles: list[BloggerProfile],
+        ) -> BatchMatchResult:
+            self.calls.append((ideal_profile, candidate_profiles))
+            if match_error is not None:
+                raise match_error
+            if match_result is not None:
+                return match_result
+            return BatchMatchResult(
+                matches=[_match_result(profile.username) for profile in candidate_profiles],
+                errors=[],
+                total_candidates=len(candidate_profiles),
+                successful_matches=len(candidate_profiles),
+                failed_matches=0,
+            )
 
     class FakeDiscoveryQueryBuilder:
         pass
@@ -616,7 +767,11 @@ def _patch_pipeline(
     monkeypatch.setattr(main_module, "ApifyService", FakeApifyService)
     monkeypatch.setattr(main_module, "IdealProfilePromptBuilder", FakeIdealProfilePromptBuilder)
     monkeypatch.setattr(main_module, "IdealProfileService", FakeIdealProfileService)
+    monkeypatch.setattr(main_module, "LLMService", FakeLLMService)
+    monkeypatch.setattr(main_module, "PromptBuilder", FakePromptBuilder)
+    monkeypatch.setattr(main_module, "MatcherPromptBuilder", FakeMatcherPromptBuilder)
     monkeypatch.setattr(main_module, "MatcherService", FakeMatcherService, raising=False)
+    monkeypatch.setattr(main_module, "BatchMatcherService", FakeBatchMatcherService)
     monkeypatch.setattr(main_module, "DiscoveryQueryBuilder", FakeDiscoveryQueryBuilder)
     monkeypatch.setattr(main_module, "BraveSearchClient", FakeBraveSearchClient)
     monkeypatch.setattr(main_module, "DiscoveryService", FakeDiscoveryService)
@@ -653,6 +808,17 @@ def _patch_pipeline(
             original_save_discovered_profiles(enrichment_result, output_path=output_path)
 
     monkeypatch.setattr(main_module, "save_discovered_profiles", fake_save_discovered_profiles)
+
+    original_save_match_results = main_module.save_match_results
+
+    def fake_save_match_results(batch_result: BatchMatchResult, output_path=main_module.MATCH_RESULTS_PATH) -> None:
+        if match_save_error is not None:
+            raise match_save_error
+        if match_output_path is not None:
+            output_path = match_output_path
+            original_save_match_results(batch_result, output_path=output_path)
+
+    monkeypatch.setattr(main_module, "save_match_results", fake_save_match_results)
 
     if analysis_output_path is not None:
         original_save_analysis_results = main_module.save_analysis_results
@@ -725,6 +891,40 @@ def _ideal_profile_analysis(source_profiles_count: int = 1, niche: str = "лай
         data_limitations=[],
         explanation="Портрет построен по доступным данным профилей.",
         confidence=60.0,
+    )
+
+
+def _match_result(username: str) -> BloggerMatchResult:
+    return BloggerMatchResult(
+        profile_url=f"https://www.instagram.com/{username}/",
+        username=username,
+        final_score=82,
+        decision=MatchDecision.RECOMMENDED,
+        region_status=RegionStatus.TARGET,
+        region_confidence=80,
+        detected_region="Россия",
+        strengths=["Тематика совпадает."],
+        risks=[],
+        rejection_reasons=[],
+        match_summary="Кандидат подходит.",
+        criteria_scores=MatchCriteriaScores(
+            thematic_fit=_criterion(),
+            audience_fit=_criterion(),
+            geography_fit=_criterion(),
+            language_fit=_criterion(),
+            account_size_fit=_criterion(),
+            engagement_fit=_criterion(),
+            content_style_fit=_criterion(),
+            commercial_fit=_criterion(),
+        ),
+    )
+
+
+def _criterion() -> MatchCriterionScore:
+    return MatchCriterionScore(
+        score=80,
+        confidence=70,
+        reason="Тестовая причина.",
     )
 
 

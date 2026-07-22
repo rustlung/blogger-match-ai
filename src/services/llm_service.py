@@ -9,8 +9,10 @@ from openai import (
     OpenAI,
     RateLimitError,
 )
+from pydantic import ValidationError
 
 from src.models.candidate_analysis import CandidateAnalysis
+from src.models.blogger_match_result import BloggerMatchResult
 from src.utils.logger import logger
 
 
@@ -89,6 +91,64 @@ class LLMService:
             raise LLMServiceError("LLM response did not contain structured analysis.")
 
         logger.info("LLM analysis request completed. model=%s", self._model)
+        return parsed
+
+    def analyze_match(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> BloggerMatchResult:
+        self._validate(system_prompt, user_prompt)
+
+        logger.info("Starting LLM match request. model=%s", self._model)
+
+        try:
+            completion = self._client.chat.completions.parse(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                response_format=BloggerMatchResult,
+            )
+        except APITimeoutError as exc:
+            logger.warning("LLM match request failed. error_type=timeout")
+            raise LLMServiceError("LLM match request timed out.") from exc
+        except APIConnectionError as exc:
+            logger.warning("LLM match request failed. error_type=connection")
+            raise LLMServiceError("LLM match API connection failed.") from exc
+        except AuthenticationError as exc:
+            logger.warning("LLM match request failed. error_type=authentication")
+            raise LLMServiceError("LLM match authentication failed.") from exc
+        except RateLimitError as exc:
+            logger.warning("LLM match request failed. error_type=rate_limit")
+            raise LLMServiceError("LLM match rate limit exceeded.") from exc
+        except BadRequestError as exc:
+            logger.warning("LLM match request failed. error_type=bad_request")
+            raise LLMServiceError("LLM match API rejected the request.") from exc
+        except APIError as exc:
+            logger.warning("LLM match request failed. error_type=api_error")
+            raise LLMServiceError("LLM match API request failed.") from exc
+        except ValidationError as exc:
+            logger.warning("LLM match request failed. error_type=validation")
+            raise LLMServiceError("LLM match response failed validation.") from exc
+
+        message = completion.choices[0].message
+        refusal = getattr(message, "refusal", None)
+        if refusal:
+            raise LLMServiceError("LLM refused to match the candidate.")
+
+        parsed = getattr(message, "parsed", None)
+        if parsed is None:
+            raise LLMServiceError("LLM response did not contain structured match result.")
+
+        logger.info("LLM match request completed. model=%s", self._model)
         return parsed
 
     def _validate(self, system_prompt: str, user_prompt: str) -> None:

@@ -5,12 +5,15 @@ from pathlib import Path
 from src.config import settings
 from src.models.analyzed_candidate import AnalyzedCandidate
 from src.models.apify_enrichment_result import ApifyEnrichmentResult
+from src.models.batch_match_result import BatchMatchError, BatchMatchResult
 from src.models.blogger import BloggerProfile
+from src.models.blogger_match_result import MatchDecision
 from src.models.discovery import DiscoveryResult
 from src.models.failed_profile import FailedProfile
 from src.models.ideal_blogger_profile import IdealBloggerProfile
 from src.models.ideal_profile_analysis import IdealProfileAnalysis
 from src.services.apify_service import ApifyService, ApifyServiceError
+from src.services.batch_matcher_service import BatchMatcherService, BatchMatcherServiceError
 from src.services.brave_search_client import BraveSearchClient
 from src.services.discovery_query_builder import DiscoveryQueryBuilder
 from src.services.discovery_service import DiscoveryService, DiscoveryServiceError, reference_usernames_from_urls
@@ -20,6 +23,10 @@ from src.services.discovered_profile_enrichment_service import (
 )
 from src.services.ideal_profile_prompt_builder import IdealProfilePromptBuilder
 from src.services.ideal_profile_service import IdealProfileService, IdealProfileServiceError
+from src.services.llm_service import LLMService
+from src.services.matcher_prompt_builder import MatcherPromptBuilder
+from src.services.matcher_service import MatcherService
+from src.services.prompt_builder import PromptBuilder
 from src.services.sheets_service import SheetsService, SheetsServiceError
 from src.utils.json_writer import AtomicJsonWriteError, atomic_write_json
 from src.utils.logger import logger
@@ -29,6 +36,7 @@ ANALYSIS_RESULTS_PATH = Path("results/analysis_results.json")
 IDEAL_PROFILE_RESULTS_PATH = Path("results/ideal_blogger_profile.json")
 DISCOVERED_CANDIDATES_PATH = Path("results/discovered_candidates.json")
 DISCOVERED_PROFILES_PATH = Path("results/discovered_profiles.json")
+MATCH_RESULTS_PATH = Path("results/match_results.json")
 MIN_RECOMMENDED_REFERENCE_PROFILES = 3
 
 
@@ -45,6 +53,10 @@ class DiscoveryResultsSaveError(RuntimeError):
 
 
 class DiscoveredProfilesSaveError(RuntimeError):
+    pass
+
+
+class MatchResultsSaveError(RuntimeError):
     pass
 
 
@@ -203,6 +215,36 @@ def main() -> int:
     print(f"Candidate profile load errors: {len(discovered_profiles_result.failed_profiles)}")
     print("Discovered profiles saved to results/discovered_profiles.json")
 
+    llm_service = LLMService(
+        api_key=settings.openai_api_key or "",
+        base_url=settings.openai_base_url,
+        model=settings.openai_model,
+        timeout=settings.openai_request_timeout_seconds,
+    )
+    matcher_service = MatcherService(
+        prompt_builder=PromptBuilder(),
+        llm_service=llm_service,
+        matcher_prompt_builder=MatcherPromptBuilder(),
+    )
+    batch_matcher_service = BatchMatcherService(matcher_service=matcher_service)
+
+    try:
+        match_result = batch_matcher_service.match_candidates(
+            ideal_profile=profile_analysis.ideal_profile,
+            candidate_profiles=discovered_profiles_result.profiles,
+        )
+    except BatchMatcherServiceError as e:
+        if e.result is not None:
+            _print_match_diagnostics(e.result)
+        print(f"Ошибка: {e}")
+        return 1
+
+    if not _save_match_results_or_report_error(match_result):
+        return 1
+
+    _print_match_diagnostics(match_result)
+    print("Match results saved to results/match_results.json")
+
     return 0
 
 
@@ -338,6 +380,16 @@ def save_discovered_profiles(
         raise DiscoveredProfilesSaveError("Не удалось сохранить найденные профили.") from exc
 
 
+def save_match_results(
+    batch_result: BatchMatchResult,
+    output_path: Path = MATCH_RESULTS_PATH,
+) -> None:
+    try:
+        atomic_write_json(batch_result.model_dump(mode="json"), output_path)
+    except AtomicJsonWriteError as exc:
+        raise MatchResultsSaveError("Не удалось сохранить результаты матчинг-анализа.") from exc
+
+
 def _save_results_or_report_error(
     *,
     analyzed_candidates: list[AnalyzedCandidate],
@@ -398,6 +450,17 @@ def _save_discovered_profiles_or_report_error(enrichment_result: ApifyEnrichment
         save_discovered_profiles(enrichment_result)
     except DiscoveredProfilesSaveError as e:
         logger.error("Discovered profiles save failed: error_type=%s", type(e.__cause__).__name__)
+        print(f"Ошибка: {e}")
+        return False
+
+    return True
+
+
+def _save_match_results_or_report_error(batch_result: BatchMatchResult) -> bool:
+    try:
+        save_match_results(batch_result)
+    except MatchResultsSaveError as e:
+        logger.error("Match results save failed: error_type=%s", type(e.__cause__).__name__)
         print(f"Ошибка: {e}")
         return False
 
@@ -502,6 +565,41 @@ def _print_analysis_summary(
         print("LLM analysis failures:")
         for blogger, error_message in analysis_failures:
             print(f"- {_blogger_identifier(blogger)} — {error_message}")
+
+
+def _print_match_diagnostics(batch_result: BatchMatchResult) -> None:
+    decisions = _match_decision_counts(batch_result)
+
+    print()
+    print("Matcher summary")
+    print(f"Total candidates: {batch_result.total_candidates}")
+    print(f"Successfully matched: {batch_result.successful_matches}")
+    print(f"Technical errors: {batch_result.failed_matches}")
+    print(f"Recommended: {decisions[MatchDecision.RECOMMENDED]}")
+    print(f"Review: {decisions[MatchDecision.REVIEW]}")
+    print(f"Rejected: {decisions[MatchDecision.REJECTED]}")
+    print("Match results path: results/match_results.json")
+
+    if batch_result.errors:
+        print()
+        print("Matcher technical errors:")
+        for error in batch_result.errors:
+            print(f"- {_match_error_identifier(error)} — {error.error_type}: {error.error_message}")
+
+
+def _match_decision_counts(batch_result: BatchMatchResult) -> dict[MatchDecision, int]:
+    counts = {
+        MatchDecision.RECOMMENDED: 0,
+        MatchDecision.REVIEW: 0,
+        MatchDecision.REJECTED: 0,
+    }
+    for match in batch_result.matches:
+        counts[match.decision] += 1
+    return counts
+
+
+def _match_error_identifier(error: BatchMatchError) -> str:
+    return error.username or error.profile_url or "-"
 
 
 def _display(value: object) -> object:
