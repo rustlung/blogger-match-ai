@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
@@ -26,7 +27,23 @@ class BraveSearchClient:
 
     def search(self, query: str) -> list[dict[str, Any]]:
         self._validate()
+        results = self._search_once(query)
+        logger.info("Brave Search primary query results: query=%s results_count=%s", query, len(results))
+        if results:
+            return results
 
+        fallback_query = _fallback_query(query)
+        logger.info("Brave Search fallback query started: original_query=%s fallback_query=%s", query, fallback_query)
+        fallback_results = self._search_once(fallback_query)
+        logger.info(
+            "Brave Search fallback query completed: original_query=%s fallback_query=%s results_count=%s",
+            query,
+            fallback_query,
+            len(fallback_results),
+        )
+        return fallback_results
+
+    def _search_once(self, query: str) -> list[dict[str, Any]]:
         try:
             with httpx.Client(timeout=self._timeout_seconds) as client:
                 response = client.get(
@@ -84,6 +101,10 @@ class BraveSearchClient:
             return []
 
         results = web_results.get("results")
+        if results is None:
+            logger.warning("Brave Search response has no web.results field.")
+            return []
+
         if not isinstance(results, list):
             raise BraveSearchClientError("Brave Search response does not contain web results.")
 
@@ -112,6 +133,12 @@ def _http_error_message(status_code: int) -> str:
         return f"Brave Search временно недоступен или вернул серверную ошибку (HTTP {status_code})."
 
     return f"Brave Search returned HTTP {status_code}."
+
+
+def _fallback_query(query: str) -> str:
+    simplified = query.replace('"', " ").replace("-", " ")
+    simplified = re.sub(r"\b(блогер|россия)\b", " ", simplified, flags=re.IGNORECASE)
+    return " ".join(simplified.split())
 
 
 def _log_response_diagnostics(

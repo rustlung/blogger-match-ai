@@ -80,7 +80,7 @@ def test_brave_search_client_logs_zero_web_results_for_empty_results_list(
         (422, {"error": "params"}, "параметры запроса"),
         (429, {"error": "quota"}, "лимит тарифа"),
         (500, {"error": "server"}, "серверную ошибку"),
-        (200, {"web": {"results": None}}, "web results"),
+        (200, {"web": {"results": "bad shape"}}, "web results"),
     ],
 )
 def test_brave_search_client_raises_error_for_bad_responses(
@@ -174,6 +174,85 @@ def test_brave_search_client_logs_safe_response_fragment_without_secret(
     assert "X-Subscription-Token" not in caplog.text
 
 
+def test_brave_search_client_does_not_call_fallback_when_primary_query_has_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_httpx = _fake_httpx(response=_response(200, {"web": {"results": [{"url": "https://instagram.com/a/"}]}}))
+    monkeypatch.setattr(brave_search_client, "httpx", fake_httpx)
+
+    result = BraveSearchClient(api_key="secret-key").search('site:instagram.com "дом-уют" блогер Россия')
+
+    assert result == [{"url": "https://instagram.com/a/"}]
+    assert _requested_queries(fake_httpx) == [
+        'site:instagram.com "дом-уют" блогер Россия'
+    ]
+
+
+def test_brave_search_client_calls_single_simplified_fallback_when_primary_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="blogger_match_ai")
+    fake_httpx = _fake_httpx(
+        responses=[
+            _response(200, {"query": {"bad_results": True, "should_fallback": True}, "mixed": {}}),
+            _response(200, {"web": {"results": [{"url": "https://instagram.com/fallback/"}]}}),
+        ]
+    )
+    monkeypatch.setattr(brave_search_client, "httpx", fake_httpx)
+
+    result = BraveSearchClient(api_key="secret-key").search('site:instagram.com "дом-уют" блогер Россия')
+
+    assert result == [{"url": "https://instagram.com/fallback/"}]
+    assert _requested_queries(fake_httpx) == [
+        'site:instagram.com "дом-уют" блогер Россия',
+        "site:instagram.com дом уют",
+    ]
+    assert "fallback_query=site:instagram.com дом уют" in caplog.text
+    assert "results_count=1" in caplog.text
+
+
+def test_brave_search_client_returns_empty_list_when_primary_and_fallback_are_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_httpx = _fake_httpx(
+        responses=[
+            _response(200, {"web": {"results": []}}),
+            _response(200, {"web": {"results": []}}),
+        ]
+    )
+    monkeypatch.setattr(brave_search_client, "httpx", fake_httpx)
+
+    result = BraveSearchClient(api_key="secret-key").search('site:instagram.com "дом" блогер Россия')
+
+    assert result == []
+    assert _requested_queries(fake_httpx) == [
+        'site:instagram.com "дом" блогер Россия',
+        "site:instagram.com дом",
+    ]
+
+
+def test_brave_search_client_calls_fallback_only_once_for_one_primary_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_httpx = _fake_httpx(
+        responses=[
+            _response(200, {"query": {"bad_results": True, "should_fallback": True}, "mixed": {}}),
+            _response(200, {"query": {"bad_results": True, "should_fallback": True}, "mixed": {}}),
+            _response(200, {"web": {"results": [{"url": "https://instagram.com/third/"}]}}),
+        ]
+    )
+    monkeypatch.setattr(brave_search_client, "httpx", fake_httpx)
+
+    result = BraveSearchClient(api_key="secret-key").search('site:instagram.com "мама-блог" блогер Россия')
+
+    assert result == []
+    assert _requested_queries(fake_httpx) == [
+        'site:instagram.com "мама-блог" блогер Россия',
+        "site:instagram.com мама блог",
+    ]
+
+
 def test_brave_search_client_raises_error_for_invalid_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(brave_search_client, "httpx", _fake_httpx(response=_invalid_json_response()))
 
@@ -234,8 +313,21 @@ def _invalid_json_response() -> Any:
     return FakeResponse()
 
 
-def _fake_httpx(response: Any | None = None, exception: Exception | None = None) -> Any:
+def _requested_queries(fake_httpx: Any) -> list[str]:
+    return [
+        request["params"]["q"]
+        for client in fake_httpx.clients
+        for request in client.requests
+    ]
+
+
+def _fake_httpx(
+    response: Any | None = None,
+    responses: list[Any] | None = None,
+    exception: Exception | None = None,
+) -> Any:
     clients: list[Any] = []
+    response_queue = list(responses or [])
 
     class FakeClient:
         def __init__(self, timeout: float) -> None:
@@ -253,6 +345,8 @@ def _fake_httpx(response: Any | None = None, exception: Exception | None = None)
             self.requests.append({"url": url, **kwargs})
             if exception is not None:
                 raise exception
+            if response_queue:
+                return response_queue.pop(0)
             return response
 
     return type(
