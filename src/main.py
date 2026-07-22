@@ -1,4 +1,7 @@
+import json
 import sys
+from datetime import datetime
+from pathlib import Path
 
 from src.config import settings
 from src.models.analyzed_candidate import AnalyzedCandidate
@@ -11,6 +14,13 @@ from src.services.matcher_service import MatcherService
 from src.services.prompt_builder import PromptBuilder
 from src.services.sheets_service import SheetsService, SheetsServiceError
 from src.utils.logger import logger
+
+
+ANALYSIS_RESULTS_PATH = Path("results/analysis_results.json")
+
+
+class AnalysisResultsSaveError(RuntimeError):
+    pass
 
 
 def main() -> int:
@@ -70,13 +80,21 @@ def main() -> int:
     if not enrichment_result.profiles:
         print()
         print("No successful Apify profiles available for AI analysis.")
-        _print_analysis_summary(
-            profiles_received=len(enrichment_result.profiles),
+        summary = _analysis_summary_payload(
+            profiles_received_from_apify=len(enrichment_result.profiles),
             apify_failures=len(enrichment_result.failed_profiles),
             sent_to_llm=0,
-            analyzed_candidates=[],
-            analysis_failures=[],
+            analyzed_successfully=0,
+            llm_failures=0,
         )
+        _print_analysis_summary(summary=summary, analysis_failures=[])
+        if not _save_results_or_report_error(
+            analyzed_candidates=[],
+            apify_failures=enrichment_result.failed_profiles,
+            analysis_failures=[],
+            summary=summary,
+        ):
+            return 1
         return 0
 
     llm_config_error = _validate_llm_configuration()
@@ -113,13 +131,22 @@ def main() -> int:
         analyzed_candidates.append(analyzed_candidate)
         _print_analyzed_candidate(analyzed_candidate)
 
-    _print_analysis_summary(
-        profiles_received=len(enrichment_result.profiles),
+    summary = _analysis_summary_payload(
+        profiles_received_from_apify=len(enrichment_result.profiles),
         apify_failures=len(enrichment_result.failed_profiles),
         sent_to_llm=len(enrichment_result.profiles),
-        analyzed_candidates=analyzed_candidates,
-        analysis_failures=analysis_failures,
+        analyzed_successfully=len(analyzed_candidates),
+        llm_failures=len(analysis_failures),
     )
+    _print_analysis_summary(summary=summary, analysis_failures=analysis_failures)
+
+    if not _save_results_or_report_error(
+        analyzed_candidates=analyzed_candidates,
+        apify_failures=enrichment_result.failed_profiles,
+        analysis_failures=analysis_failures,
+        summary=summary,
+    ):
+        return 1
 
     if not analyzed_candidates and analysis_failures:
         return 1
@@ -184,20 +211,114 @@ def _print_analyzed_candidate(candidate: AnalyzedCandidate) -> None:
         print("- Not specified")
 
 
-def _print_analysis_summary(
-    profiles_received: int,
+def save_analysis_results(
+    *,
+    analyzed_candidates: list[AnalyzedCandidate],
+    apify_failures: list[FailedProfile],
+    analysis_failures: list[tuple[BloggerProfile, str]],
+    summary: dict[str, int],
+    output_path: Path = ANALYSIS_RESULTS_PATH,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(f"{output_path.name}.tmp")
+    payload = {
+        "generated_at": _generated_at(),
+        "summary": summary,
+        "analyzed_candidates": [_analyzed_candidate_payload(candidate) for candidate in analyzed_candidates],
+        "apify_failures": [failed_profile.model_dump(mode="json") for failed_profile in apify_failures],
+        "llm_failures": [_llm_failure_payload(blogger, error) for blogger, error in analysis_failures],
+    }
+
+    try:
+        with temp_path.open("w", encoding="utf-8") as file:
+            json.dump(
+                payload,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+            file.write("\n")
+        temp_path.replace(output_path)
+    except Exception as exc:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise AnalysisResultsSaveError("Не удалось сохранить результаты анализа.") from exc
+
+
+def _save_results_or_report_error(
+    *,
+    analyzed_candidates: list[AnalyzedCandidate],
+    apify_failures: list[FailedProfile],
+    analysis_failures: list[tuple[BloggerProfile, str]],
+    summary: dict[str, int],
+) -> bool:
+    try:
+        save_analysis_results(
+            analyzed_candidates=analyzed_candidates,
+            apify_failures=apify_failures,
+            analysis_failures=analysis_failures,
+            summary=summary,
+        )
+    except AnalysisResultsSaveError as e:
+        logger.error("Analysis results save failed: error_type=%s", type(e.__cause__).__name__)
+        print(f"Ошибка: {e}")
+        return False
+
+    print("Analysis results saved to results/analysis_results.json")
+    return True
+
+
+def _analysis_summary_payload(
+    *,
+    profiles_received_from_apify: int,
     apify_failures: int,
     sent_to_llm: int,
-    analyzed_candidates: list[AnalyzedCandidate],
+    analyzed_successfully: int,
+    llm_failures: int,
+) -> dict[str, int]:
+    return {
+        "profiles_received_from_apify": profiles_received_from_apify,
+        "apify_failures": apify_failures,
+        "sent_to_llm": sent_to_llm,
+        "analyzed_successfully": analyzed_successfully,
+        "llm_failures": llm_failures,
+    }
+
+
+def _analyzed_candidate_payload(candidate: AnalyzedCandidate) -> dict[str, object]:
+    blogger_payload = candidate.blogger.model_dump(mode="json", exclude={"raw_data"})
+    return {
+        "blogger": blogger_payload,
+        "analysis": candidate.analysis.model_dump(mode="json"),
+    }
+
+
+def _llm_failure_payload(blogger: BloggerProfile, error_message: str) -> dict[str, str | None]:
+    return {
+        "username": blogger.username or None,
+        "profile_url": blogger.profile_url or blogger.input_url,
+        "error": error_message,
+    }
+
+
+def _generated_at() -> str:
+    return datetime.now().astimezone().isoformat()
+
+
+def _print_analysis_summary(
+    *,
+    summary: dict[str, int],
     analysis_failures: list[tuple[BloggerProfile, str]],
 ) -> None:
     print()
     print("Analysis summary")
-    print(f"Profiles received from Apify: {profiles_received}")
-    print(f"Apify failures: {apify_failures}")
-    print(f"Sent to LLM: {sent_to_llm}")
-    print(f"Analyzed successfully: {len(analyzed_candidates)}")
-    print(f"LLM failures: {len(analysis_failures)}")
+    print(f"Profiles received from Apify: {summary['profiles_received_from_apify']}")
+    print(f"Apify failures: {summary['apify_failures']}")
+    print(f"Sent to LLM: {summary['sent_to_llm']}")
+    print(f"Analyzed successfully: {summary['analyzed_successfully']}")
+    print(f"LLM failures: {summary['llm_failures']}")
 
     if analysis_failures:
         print()
